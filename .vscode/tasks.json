@@ -1,0 +1,20 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build PlatformIO (C3 and S3)",
+			"type": "shell",
+			"command": "platformio",
+			"args": [
+				"run",
+				"-d",
+				"C3",
+				"-d",
+				"S3"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		}
+	]
+}
