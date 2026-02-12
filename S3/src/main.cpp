@@ -11,6 +11,7 @@ constexpr int kMinInput = 10;
 constexpr int kMaxInput = 100;
 constexpr uint32_t kMinFreqHz = 60000;
 constexpr uint32_t kMaxFreqHz = 160000;
+constexpr int kLedPin = 2;
 
 struct ControlPacket {
   uint32_t freq_hz;
@@ -64,11 +65,23 @@ bool parseLine(String line, ControlPacket &out_packet) {
   out_packet.freq_hz = mapInputToFreq(value);
   return true;
 }
+
+void blinkConnectionConfirmed() {
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(kLedPin, HIGH);
+    delay(200);
+    digitalWrite(kLedPin, LOW);
+    delay(200);
+  }
+}
 } // namespace
 
 void setup() {
   Serial.begin(115200);
   delay(200);
+
+  pinMode(kLedPin, OUTPUT);
+  digitalWrite(kLedPin, LOW);
 
   WiFi.mode(WIFI_AP);
   WiFi.softAP(kApSsid, kApPass, kWifiChannel);
@@ -92,6 +105,8 @@ void setup() {
     return;
   }
 
+  Serial.println("ESP-NOW connection established!");
+  blinkConnectionConfirmed();
   Serial.println("Type 10-100 to set freq, or 'forward'/'reverse'.");
 }
 

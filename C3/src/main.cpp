@@ -9,6 +9,7 @@ constexpr uint8_t kWifiChannel = 6;
 
 constexpr int kEnablePin = 2;  // BENABLE
 constexpr int kPhasePin = 3;   // BPHASE
+constexpr int kLedPin = 8;     // Built-in LED for connection confirmation
 constexpr int kPwmChannel = 0;
 constexpr int kPwmResolutionBits = 8;
 constexpr uint32_t kDefaultFreqHz = 60000;
@@ -19,11 +20,21 @@ struct ControlPacket {
 };
 
 ControlPacket g_packet{ kDefaultFreqHz, 1 };
+bool g_connection_confirmed = false;
 
 void applyPwm(uint32_t freq_hz) {
   ledcSetup(kPwmChannel, freq_hz, kPwmResolutionBits);
   const uint32_t duty = (1u << kPwmResolutionBits) / 2u;
   ledcWrite(kPwmChannel, duty);
+}
+
+void blinkConnectionConfirmed() {
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(kLedPin, HIGH);
+    delay(200);
+    digitalWrite(kLedPin, LOW);
+    delay(200);
+  }
 }
 
 void onDataRecv(const uint8_t *, const uint8_t *data, int len) {
@@ -34,6 +45,13 @@ void onDataRecv(const uint8_t *, const uint8_t *data, int len) {
   ControlPacket incoming = {};
   memcpy(&incoming, data, sizeof(incoming));
   g_packet = incoming;
+
+  // Blink LED on first successful packet to confirm connection
+  if (!g_connection_confirmed) {
+    g_connection_confirmed = true;
+    Serial.println("ESP-NOW connection confirmed!");
+    blinkConnectionConfirmed();
+  }
 
   digitalWrite(kPhasePin, g_packet.direction ? HIGH : LOW);
   applyPwm(g_packet.freq_hz);
@@ -46,6 +64,9 @@ void setup() {
 
   pinMode(kPhasePin, OUTPUT);
   digitalWrite(kPhasePin, HIGH);
+  
+  pinMode(kLedPin, OUTPUT);
+  digitalWrite(kLedPin, LOW);
 
   ledcAttachPin(kEnablePin, kPwmChannel);
   applyPwm(kDefaultFreqHz);
