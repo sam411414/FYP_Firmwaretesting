@@ -3,90 +3,95 @@
 #include <esp_now.h>
 
 namespace {
-constexpr uint8_t kBroadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-constexpr char kApSsid[] = "S3-ESP-NOW";
-constexpr char kApPass[] = "espnow123";
-constexpr uint8_t kWifiChannel = 6;
-constexpr int kMinInput = 10;
-constexpr int kMaxInput = 100;
-constexpr uint32_t kMinFreqHz = 60000;
-constexpr uint32_t kMaxFreqHz = 160000;
-constexpr int kLedPin = 2;
+constexpr uint8_t kC3MacAddr[6] = {0xA0, 0x76, 0x4E, 0x7B, 0x9A, 0xB4};
+constexpr size_t kMaxTextLen = 240;
 
-struct ControlPacket {
-  uint32_t freq_hz;
-  uint8_t direction;
+enum PacketType : uint8_t {
+  kPacketText = 1,
+  kPacketControl = 2
 };
 
-ControlPacket g_packet{ kMinFreqHz, 1 };
+struct TextPacket {
+  uint8_t type;
+  char text[kMaxTextLen];
+};
 
-uint32_t mapInputToFreq(int value) {
-  if (value < kMinInput) {
-    value = kMinInput;
-  }
-  if (value > kMaxInput) {
-    value = kMaxInput;
-  }
-  const uint32_t span = kMaxFreqHz - kMinFreqHz;
-  const uint32_t scaled = static_cast<uint32_t>(value - kMinInput) * span;
-  return kMinFreqHz + (scaled / static_cast<uint32_t>(kMaxInput - kMinInput));
+struct ControlPacket {
+  uint8_t type;
+  uint8_t duty_cycle; // 40-100
+  uint8_t direction;  // 0=reverse, 1=forward
+  uint8_t enable;     // 0=stop, 1=run
+};
+
+ControlPacket g_control{ kPacketControl, 50, 1, 1 };
+
+void printMac(const uint8_t *mac) {
+  char buffer[18];
+  snprintf(buffer, sizeof(buffer), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  Serial.print(buffer);
 }
 
-void onDataSent(const uint8_t *, esp_now_send_status_t status) {
-  Serial.print("ESP-NOW send: ");
+void onDataSent(const uint8_t *mac, esp_now_send_status_t status) {
+  Serial.print("TX to ");
+  printMac(mac);
+  Serial.print(" | status: ");
   Serial.println(status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
 }
 
-bool parseLine(String line, ControlPacket &out_packet) {
-  line.trim();
-  line.toLowerCase();
+bool addPeer(const uint8_t *mac) {
+  esp_now_peer_info_t peer_info = {};
+  memcpy(peer_info.peer_addr, mac, 6);
+  peer_info.channel = 0; // Auto-select channel
+  peer_info.encrypt = false;
+  return esp_now_add_peer(&peer_info) == ESP_OK;
+}
 
-  if (line == "forward") {
-    out_packet.direction = 1;
-    return true;
-  }
-  if (line == "reverse") {
-    out_packet.direction = 0;
-    return true;
-  }
-
-  bool is_number = true;
-  for (size_t i = 0; i < line.length(); ++i) {
-    if (!isDigit(line[i])) {
-      is_number = false;
-      break;
-    }
-  }
-  if (!is_number || line.isEmpty()) {
+bool isNumber(const String &text) {
+  if (text.isEmpty()) {
     return false;
   }
-
-  const int value = line.toInt();
-  out_packet.freq_hz = mapInputToFreq(value);
+  for (size_t i = 0; i < text.length(); ++i) {
+    if (!isDigit(text[i])) {
+      return false;
+    }
+  }
   return true;
 }
 
-void blinkConnectionConfirmed() {
-  for (int i = 0; i < 5; i++) {
-    digitalWrite(kLedPin, HIGH);
-    delay(200);
-    digitalWrite(kLedPin, LOW);
-    delay(200);
+void sendText(const String &line) {
+  TextPacket packet = {};
+  packet.type = kPacketText;
+
+  String payload = line;
+  if (payload.length() >= kMaxTextLen) {
+    payload = payload.substring(0, kMaxTextLen - 1);
+    Serial.println("Message truncated to 239 chars.");
   }
+  payload.toCharArray(packet.text, sizeof(packet.text));
+
+  esp_now_send(kC3MacAddr, reinterpret_cast<const uint8_t *>(&packet),
+               sizeof(packet));
+}
+
+void sendControl() {
+  esp_now_send(kC3MacAddr, reinterpret_cast<const uint8_t *>(&g_control),
+               sizeof(g_control));
 }
 } // namespace
 
 void setup() {
   Serial.begin(115200);
-  delay(200);
+  delay(500);
 
-  pinMode(kLedPin, OUTPUT);
-  digitalWrite(kLedPin, LOW);
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
 
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(kApSsid, kApPass, kWifiChannel);
-  Serial.print("S3 MAC: ");
-  Serial.println(WiFi.softAPmacAddress());
+  Serial.print("S3 MAC Address: ");
+  Serial.println(WiFi.macAddress());
+  Serial.print("C3 Target MAC: ");
+  printMac(kC3MacAddr);
+  Serial.println();
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW init failed");
@@ -95,36 +100,59 @@ void setup() {
 
   esp_now_register_send_cb(onDataSent);
 
-  esp_now_peer_info_t peer_info = {};
-  memcpy(peer_info.peer_addr, kBroadcastMac, sizeof(kBroadcastMac));
-  peer_info.channel = kWifiChannel;
-  peer_info.encrypt = false;
-
-  if (esp_now_add_peer(&peer_info) != ESP_OK) {
-    Serial.println("ESP-NOW add peer failed");
+  if (!addPeer(kC3MacAddr)) {
+    Serial.println("Failed to add C3 peer");
     return;
   }
 
-  Serial.println("ESP-NOW connection established!");
-  blinkConnectionConfirmed();
-  Serial.println("Type 10-100 to set freq, or 'forward'/'reverse'.");
+  Serial.println("Type a command or message, then press Enter.");
+  Serial.println("Commands: forward, reverse, stop, 40-100");
 }
 
 void loop() {
   if (!Serial.available()) {
+    delay(10);
     return;
   }
 
   String line = Serial.readStringUntil('\n');
-  ControlPacket updated = g_packet;
-  if (!parseLine(line, updated)) {
-    Serial.println("Invalid input. Use 10-100, forward, or reverse.");
+  line.trim();
+  line.toLowerCase();
+  if (line.isEmpty()) {
     return;
   }
 
-  g_packet = updated;
-  const esp_err_t result = esp_now_send(kBroadcastMac, reinterpret_cast<uint8_t*>(&g_packet), sizeof(g_packet));
-  if (result != ESP_OK) {
-    Serial.println("ESP-NOW send failed");
+  if (line == "forward") {
+    g_control.direction = 1;
+    g_control.enable = 1;
+    sendControl();
+    return;
   }
+
+  if (line == "reverse") {
+    g_control.direction = 0;
+    g_control.enable = 1;
+    sendControl();
+    return;
+  }
+
+  if (line == "stop") {
+    g_control.enable = 0;
+    sendControl();
+    return;
+  }
+
+  if (isNumber(line)) {
+    const int value = line.toInt();
+    if (value >= 40 && value <= 100) {
+      g_control.duty_cycle = static_cast<uint8_t>(value);
+      g_control.enable = 1;
+      sendControl();
+    } else {
+      Serial.println("Duty cycle must be 40-100.");
+    }
+    return;
+  }
+
+  sendText(line);
 }

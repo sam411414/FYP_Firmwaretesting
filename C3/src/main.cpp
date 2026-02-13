@@ -1,85 +1,94 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include "motorControl.h"
 
 namespace {
-constexpr char kApSsid[] = "S3-ESP-NOW";
-constexpr char kApPass[] = "espnow123";
-constexpr uint8_t kWifiChannel = 6;
+constexpr size_t kMaxTextLen = 240; // Keep under ESP-NOW 250-byte payload limit
 
-constexpr int kEnablePin = 2;  // BENABLE
-constexpr int kPhasePin = 3;   // BPHASE
-constexpr int kLedPin = 8;     // Built-in LED for connection confirmation
-constexpr int kPwmChannel = 0;
-constexpr int kPwmResolutionBits = 8;
-constexpr uint32_t kDefaultFreqHz = 60000;
-
-struct ControlPacket {
-  uint32_t freq_hz;
-  uint8_t direction;
+enum PacketType : uint8_t {
+  kPacketText = 1,
+  kPacketControl = 2
 };
 
-ControlPacket g_packet{ kDefaultFreqHz, 1 };
-bool g_connection_confirmed = false;
+struct TextPacket {
+  uint8_t type;
+  char text[kMaxTextLen];
+};
 
-void applyPwm(uint32_t freq_hz) {
-  ledcSetup(kPwmChannel, freq_hz, kPwmResolutionBits);
-  const uint32_t duty = (1u << kPwmResolutionBits) / 2u;
-  ledcWrite(kPwmChannel, duty);
+struct ControlPacket {
+  uint8_t type;
+  uint8_t duty_cycle; // 40-100
+  uint8_t direction;  // 0=reverse, 1=forward
+  uint8_t enable;     // 0=stop, 1=run
+};
+
+MotorController motor;
+
+void printMac(const uint8_t *mac) {
+  char buffer[18];
+  snprintf(buffer, sizeof(buffer), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  Serial.print(buffer);
 }
 
-void blinkConnectionConfirmed() {
-  for (int i = 0; i < 5; i++) {
-    digitalWrite(kLedPin, HIGH);
-    delay(200);
-    digitalWrite(kLedPin, LOW);
-    delay(200);
+void handleControl(const ControlPacket &cmd) {
+  motor.setDirection(cmd.direction == 1);
+  motor.setEnabled(cmd.enable == 1);
+  if (cmd.enable == 1) {
+    motor.setDutyCycle(cmd.duty_cycle);
   }
+
+  Serial.print("CTRL duty=");
+  Serial.print(cmd.duty_cycle);
+  Serial.print(" dir=");
+  Serial.print(cmd.direction ? "FWD" : "REV");
+  Serial.print(" enable=");
+  Serial.println(cmd.enable ? "ON" : "OFF");
 }
 
-void onDataRecv(const uint8_t *, const uint8_t *data, int len) {
-  if (len != sizeof(ControlPacket)) {
+void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
+  if (len <= 0) {
     return;
   }
 
-  ControlPacket incoming = {};
-  memcpy(&incoming, data, sizeof(incoming));
-  g_packet = incoming;
+  const uint8_t type = data[0];
 
-  // Blink LED on first successful packet to confirm connection
-  if (!g_connection_confirmed) {
-    g_connection_confirmed = true;
-    Serial.println("ESP-NOW connection confirmed!");
-    blinkConnectionConfirmed();
+  if (type == kPacketText) {
+    TextPacket incoming = {};
+    const size_t copy_len = static_cast<size_t>(len) < sizeof(TextPacket)
+                                ? static_cast<size_t>(len)
+                                : sizeof(TextPacket);
+    memcpy(&incoming, data, copy_len);
+    incoming.text[sizeof(incoming.text) - 1] = '\0';
+
+    Serial.print("RX from ");
+    printMac(mac);
+    Serial.print(" | ");
+    Serial.println(incoming.text);
+    return;
   }
 
-  digitalWrite(kPhasePin, g_packet.direction ? HIGH : LOW);
-  applyPwm(g_packet.freq_hz);
+  if (type == kPacketControl && len >= static_cast<int>(sizeof(ControlPacket))) {
+    ControlPacket cmd = {};
+    memcpy(&cmd, data, sizeof(cmd));
+    handleControl(cmd);
+  }
 }
 } // namespace
 
 void setup() {
   Serial.begin(115200);
-  delay(200);
-
-  pinMode(kPhasePin, OUTPUT);
-  digitalWrite(kPhasePin, HIGH);
-  
-  pinMode(kLedPin, OUTPUT);
-  digitalWrite(kLedPin, LOW);
-
-  ledcAttachPin(kEnablePin, kPwmChannel);
-  applyPwm(kDefaultFreqHz);
+  delay(500);
 
   WiFi.mode(WIFI_STA);
-  WiFi.begin(kApSsid, kApPass, kWifiChannel);
-  Serial.print("C3 MAC: ");
+  WiFi.disconnect();
+
+  Serial.print("C3 MAC Address: ");
   Serial.println(WiFi.macAddress());
 
-  const unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
-    delay(100);
-  }
+  motor.initialize();
+  motor.setEnabled(false);
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW init failed");
@@ -87,9 +96,9 @@ void setup() {
   }
 
   esp_now_register_recv_cb(onDataRecv);
-  Serial.println("C3 ready for ESP-NOW control.");
+  Serial.println("C3 ready for ESP-NOW text/control.");
 }
 
 void loop() {
-  delay(100);
+  delay(10);
 }
