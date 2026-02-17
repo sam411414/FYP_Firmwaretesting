@@ -18,7 +18,7 @@ struct TextPacket {
 
 struct ControlPacket {
   uint8_t type;
-  uint8_t duty_cycle; // 40-100
+  uint8_t duty_cycle; // 0-100 input (maps to 30-90% actual, <10=stop)
   uint8_t direction;  // 0=reverse, 1=forward
   uint8_t enable;     // 0=stop, 1=run
 };
@@ -106,7 +106,7 @@ void setup() {
   }
 
   Serial.println("Type a command or message, then press Enter.");
-  Serial.println("Commands: forward, reverse, stop, 40-100");
+  Serial.println("Commands: forward, reverse, stop, 0-100 (speed, <10=stop)");
 }
 
 void loop() {
@@ -144,12 +144,12 @@ void loop() {
 
   if (isNumber(line)) {
     const int value = line.toInt();
-    if (value >= 40 && value <= 100) {
+    if (value >= 0 && value <= 100) {
       g_control.duty_cycle = static_cast<uint8_t>(value);
       g_control.enable = 1;
       sendControl();
     } else {
-      Serial.println("Duty cycle must be 40-100.");
+      Serial.println("Speed must be 0-100 (0-9=stop, 10-100 maps to 30-90 duty).");
     }
     return;
   }

@@ -81,7 +81,7 @@ The S3 processes serial commands and converts them to packets:
 | `"reverse"`   | ControlPacket | `{2, current_duty, 0, 1}` |
 | `"stop"`      | ControlPacket | `{2, current_duty, x, 0}` |
 | `"40"-"100"`  | ControlPacket | `{2, value, current_dir, 1}` |
-| Text messages | TextPacket | `{1, "message"}` |
+| Text messages | TextPacket    | `{1, "message"}` |
 
 ### Default Control State
 ```c
