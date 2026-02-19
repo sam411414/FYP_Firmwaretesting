@@ -52,7 +52,7 @@ struct TextPacket {
 ```c
 struct ControlPacket {
   uint8_t type;           // Always kPacketControl (2)
-  uint8_t duty_cycle;     // PWM duty cycle (40-100%)
+  uint8_t duty_cycle;     // PWM duty cycle (35-90%)
   uint8_t direction;      // 0=reverse, 1=forward
   uint8_t enable;         // 0=stop, 1=run
 };

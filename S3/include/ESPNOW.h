@@ -5,7 +5,6 @@
 
 // ── ESP-NOW protocol constants ──────────────────────────────────────
 constexpr size_t kMaxTextLen = 240;  // Keep under ESP-NOW 250-byte limit
-constexpr unsigned long kStatusReportIntervalMs = 5000;  // Status report every 5 seconds
 
 enum PacketType : uint8_t {
   kPacketText    = 1,
@@ -19,7 +18,7 @@ struct TextPacket {
   char    text[kMaxTextLen];
 };
 
-// Status packet sent from C3 to S3
+// Status packet received from C3
 struct StatusPacket {
   uint8_t type;        // Must be kPacketStatus (3)
   uint8_t duty_cycle;  // Current actual duty cycle
@@ -27,15 +26,14 @@ struct StatusPacket {
   uint8_t enable;      // 0=disabled, 1=enabled
 };
 
-// ── Public API ──────────────────────────────────────────────────────
+// ── Public API for S3 sender ────────────────────────────────────────
 
-// Initialise ESP-NOW and register the receive callback.
-// Pass a pointer to the MotorController so incoming motorControlPackets
-// can be dispatched automatically.
-void espnow_init(MotorController *motor);
+// Initialize ESP-NOW and add the C3 target as a peer.
+// Pass the C3 MAC address to add as peer.
+void espnow_init_sender(const uint8_t *target_mac);
 
-// Send current motor status to S3
-void espnow_send_status(const MotorController *motor);
+// Send a text message to the currently added peer
+void espnow_send_text(const String &message);
 
-// Update function to handle periodic status reporting
-void espnow_update();
+// Send a control packet to the currently added peer  
+void espnow_send_control(const ControlPacket &control);

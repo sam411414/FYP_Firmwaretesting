@@ -3,7 +3,7 @@
 #include <Arduino.h>
 
 // Control packet received over ESP-NOW (motor-specific)
-struct ControlPacket {
+struct motorControlPacket {
   uint8_t type;        // Must be kPacketControl (2)
   uint8_t duty_cycle;  // 40-100
   uint8_t direction;   // 0=reverse, 1=forward
@@ -21,8 +21,8 @@ constexpr uint32_t kDefaultFreqHz = 20000;
 
 // Duty cycle mapping limits (actual PWM duty percentages)
 constexpr uint8_t kDutyLowerLimit = 30;  // Minimum actual duty cycle (%)
-constexpr uint8_t kDutyUpperLimit = 90;  // Maximum actual duty cycle (%)
-constexpr uint8_t kDutyStopThreshold = 10; // Input below this = stop
+constexpr uint8_t kDutyUpperLimit = 95;  // Maximum actual duty cycle (%)
+constexpr uint8_t kDutyStopThreshold = 15; // Input below this = stop
 
 // Motor control class for DRV8835 interface
 class MotorController {
@@ -44,8 +44,8 @@ public:
   // Update ramping - call this frequently in loop()
   void update();
   
-  // Handle an incoming ControlPacket
-  void handleControl(const ControlPacket &cmd);
+  // Handle an incoming motorControlPacket
+  void handleControl(const motorControlPacket &cmd);
 
   // Get current settings
   uint8_t getCurrentDutyCycle() const { return current_duty_pct_; }
@@ -53,6 +53,13 @@ public:
   uint32_t getFrequency() const { return freq_hz_; }
   bool getDirection() const { return direction_; }
   bool isEnabled() const { return enabled_; }
+  
+  // Check and clear state change flag
+  bool checkAndClearStateChanged() { 
+    bool changed = state_changed_; 
+    state_changed_ = false; 
+    return changed; 
+  }
 
 private:
   uint32_t freq_hz_;
@@ -64,6 +71,7 @@ private:
   bool pending_direction_;        // Direction to switch to after ramp-down
   bool direction_change_pending_; // True while mid-direction-change
   bool enabled_;
+  bool state_changed_;            // Flag indicating motor state has changed
   
   // Internal PWM application
   void applyPwm();

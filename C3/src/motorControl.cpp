@@ -3,7 +3,8 @@
 MotorController::MotorController() 
   : freq_hz_(kDefaultFreqHz), current_duty_pct_(0), target_duty_pct_(0),
     saved_target_duty_(0), last_ramp_time_(0), direction_(true),
-    pending_direction_(true), direction_change_pending_(false), enabled_(true) {
+    pending_direction_(true), direction_change_pending_(false), enabled_(true),
+    state_changed_(false) {
 }
 
 void MotorController::initialize() {
@@ -102,7 +103,12 @@ uint8_t MotorController::mapDutyCycle(uint8_t input_percent) {
   return mapped_duty;
 }
 
-void MotorController::handleControl(const ControlPacket &cmd) {
+void MotorController::handleControl(const motorControlPacket &cmd) {
+  // Store previous state for change detection
+  uint8_t prev_duty = current_duty_pct_;
+  bool prev_direction = direction_;
+  bool prev_enabled = enabled_;
+  
   setDirection(cmd.direction == 1);
   setEnabled(cmd.enable == 1);
   if (cmd.enable == 1) {
@@ -115,4 +121,11 @@ void MotorController::handleControl(const ControlPacket &cmd) {
   Serial.print(cmd.direction ? "FWD" : "REV");
   Serial.print(" enable=");
   Serial.println(cmd.enable ? "ON" : "OFF");
+  
+  // Send immediate status update if state changed
+  if (prev_duty != target_duty_pct_ || prev_direction != direction_ || prev_enabled != enabled_) {
+    // Note: We'll use external function to avoid circular dependencies
+    // This will be handled by a callback mechanism
+    state_changed_ = true;
+  }
 }
