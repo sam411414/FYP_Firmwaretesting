@@ -2,10 +2,10 @@
 #include <WiFi.h>
 #include "motorControl.h"
 #include "ESPNOW_C3.h"
-#include "IRSensor.h"
+#include "ColorSensor.h"
 
 //MotorController motor;
-IRSensor ir_sensor1(10, 3);  // digital: GPIO10, analog: GPIO3
+ColorSensor color_sensor(5, 6, 4); // SDA: GPIO5, SCL: GPIO6, LED: GPIO4
 
 void setup() {
   Serial.begin(115200);
@@ -22,13 +22,13 @@ void setup() {
   //motor.setEnabled(false);
   //espnow_register_motor(&motor);
 
-  ir_sensor1.init();
-  espnow_register_ir(&ir_sensor1);
+  color_sensor.init();
+  espnow_register_color(&color_sensor);
 }
 
 void loop() {
   //motor.update();
-  ir_sensor1.update();
+  color_sensor.update();
   espnow_update();
 
   delay(10);

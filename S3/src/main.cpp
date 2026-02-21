@@ -20,6 +20,8 @@ void setup() {
 
   Serial.println("=== IR Sensor Commands ===");
   Serial.println("digital, analog");
+  Serial.println("=== Color Sensor Commands ===");
+  Serial.println("c, l, cl, ledon, ledoff");
 }
 
 void loop() {
@@ -47,5 +49,30 @@ void loop() {
     return;
   }
 
-  Serial.println("Unknown command. Use: digital, analog");
+  if (line == "c") {
+    espnow_send_color_control(0);
+    return;
+  }
+
+  if (line == "l") {
+    espnow_send_color_control(1);
+    return;
+  }
+
+  if (line == "cl") {
+    espnow_send_color_control(2);
+    return;
+  }
+
+  if (line == "ledon") {
+    espnow_send_color_control(3);
+    return;
+  }
+
+  if (line == "ledoff") {
+    espnow_send_color_control(4);
+    return;
+  }
+
+  Serial.println("Unknown command. Use: digital, analog, c, l, cl, ledon, ledoff");
 }

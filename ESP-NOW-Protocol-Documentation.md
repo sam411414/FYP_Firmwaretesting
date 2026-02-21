@@ -1,4 +1,4 @@
-# ESP-NOW Communication Protocol Documentation
+﻿# ESP-NOW Communication Protocol Documentation
 
 ## Overview
 
@@ -9,20 +9,27 @@ This document describes the ESP-NOW packet communication protocol between the S3
 ## System Architecture
 
 ```
-┌─────────────────────┐    ESP-NOW     ┌──────────────────────┐
-│   S3 Board          │◄──────────────►│  C3 Board            │
-│ (Command Interface) │                │  (Controller)        │
-│                     │  Commands      │                      │
-│ MAC: 30:ED:A0:      │◄───────────────│  MAC: A0:76:4E:      │
-│      27:8F:A4       │                │       7B:9A:B4       │
-│                     │  Status        │                      │
-│                     │───────────────►│                      │
-└─────────────────────┘                └──────────────────────┘
++---------------------+    ESP-NOW     +----------------------+
+|   S3 Board          |<-------------->|  C3 Board            |
+| (Command Interface) |                |  (Controller)        |
+|                     |  Commands      |                      |
+| MAC: 30:ED:A0:      |--------------->|  MAC: A0:76:4E:      |
+|      27:8F:A4       |                |       7B:9A:B4       |
+|                     |  Status        |                      |
+|                     |<---------------|                      |
++---------------------+                +----------------------+
 ```
 
-- **S3 → C3**: Sends commands (IR mode switch)
-- **C3 → S3**: Sends status (IR sensor readings)
-- **Bidirectional**: Full duplex
+- **S3 -> C3**: Sends control commands (IR mode switch, color mode/LED control)
+- **C3 -> S3**: Sends status packets (IR readings, color sensor readings)
+- **Bidirectional**: Full duplex, fire-and-forget
+
+### Hardware Summary
+
+| Board | MCU | PlatformIO Board | COM Port | Framework |
+|-------|-----|-------------------|----------|-----------|
+| S3 | ESP32-S3 | `4d_systems_esp32s3_gen4_r8n16` | COM14 | Arduino |
+| C3 | ESP32-C3-MINI-1 | `esp32-c3-devkitm-1` | COM18 | Arduino |
 
 ---
 
@@ -30,18 +37,24 @@ This document describes the ESP-NOW packet communication protocol between the S3
 
 | Pin | Function | Notes |
 |-----|----------|-------|
-| GPIO4 | IR Sensor — Digital Output (DO) | `INPUT`, LOW = obstacle |
-| GPIO3 | IR Sensor — Analog Output (AO) | `analogRead()`, 0–4095 |
+| GPIO2 | Motor -- Enable (DRV8835) | Reserved (motor commented out) |
+| GPIO3 | Motor -- Phase (DRV8835) / IR Analog (AO) | Reserved (IR not active in current build) |
+| GPIO4 | Color Sensor -- LED control | `OUTPUT`, HIGH = LED on, LOW = LED off |
+| GPIO5 | Color Sensor -- I2C SDA | TCS34725 |
+| GPIO6 | Color Sensor -- I2C SCL | TCS34725 |
 | GPIO8 | NeoPixel LED | Reserved |
 | GPIO9 | BOOT button | Reserved |
 | GPIO10+ | SPI Flash | **Do NOT use for GPIO** |
-| GPIO2, GPIO5, GPIO6, GPIO7 | Available GPIOs | Safe for future use |
 
 > **Important**: GPIO10 on the ESP32-C3-MINI-1 module is tied to SPI flash and cannot be used as general GPIO.
 
+> **Pin conflict note**: GPIO4 is used by both the IR sensor (digital output) and the color sensor (LED control). When both sensors need to be active simultaneously, the IR digital pin must be moved to a different GPIO.
+
 ---
 
-## Key Design Decision — Mode-Exclusive Pin Reading
+## Key Design Decisions
+
+### Mode-Exclusive Pin Reading (IR Sensor)
 
 The IR sensor cannot reliably drive both its **DO (digital)** and **AO (analog)** outputs simultaneously when both are being read. Continuously running `analogRead()` while also calling `digitalRead()` causes the ADC to load the sensor's internal circuitry and interferes with the LM393 comparator driving the DO line.
 
@@ -51,21 +64,45 @@ The IR sensor cannot reliably drive both its **DO (digital)** and **AO (analog)*
 - In **analog mode**: only `analogRead(GPIO3)` is called. `digitalRead(GPIO4)` is not called.
 - On mode switch, `activateDigitalMode()` / `activateAnalogMode()` reconfigure `pinMode` to put the unused pin into high-Z (`INPUT`) to stop loading the sensor output.
 
+### Safe Serial Output from ESP-NOW Callbacks
+
+The `onDataRecv()` callback runs in the Wi-Fi task, not in `loop()`. Calling `Serial.print()` directly from this callback produces truncated or garbled output.
+
+**Solution**: All status output is formatted into fixed `char[]` buffers with `snprintf()` inside the callback, setting a `volatile bool` flag. The `espnow_process()` function (called from `loop()`) checks flags and prints the complete strings.
+
+### TCS34725 Autorange
+
+The color sensor uses an autorange system based on the DN40 application note (ductsoup's autorange implementation). A 5-entry gain/integration-time table automatically adjusts for dim-to-bright conditions:
+
+| Index | Gain | Integration Time | Min Count | Max Count |
+|-------|------|-------------------|-----------|-----------|
+| 0 | 60x | 614 ms | 0 (start) | 20000 |
+| 1 | 60x | 154 ms | 4990 | 63000 |
+| 2 | 16x | 154 ms | 16790 | 63000 |
+| 3 | 4x | 154 ms | 15740 | 63000 |
+| 4 | 1x | 154 ms | 15740 | 0 (end) |
+
+When the clear channel count exceeds `max_count`, the index moves up (less sensitive). When below `min_count`, the index moves down (more sensitive). After a range change, the sensor waits for 2x the integration time before re-reading.
+
 ---
 
 ## Packet Types
 
 ```cpp
 enum PacketType : uint8_t {
-  kPacketText      = 1,  // Text message (unused in current build)
-  kPacketControl   = 2,  // Motor control (S3→C3) — reserved
-  kPacketStatus    = 3,  // Motor status  (C3→S3) — reserved
-  kPacketIRControl = 4,  // IR mode switch (S3→C3)
-  kPacketIRStatus  = 5   // IR sensor status (C3→S3)
+  kPacketText         = 1,  // Text message (unused in current build)
+  kPacketControl      = 2,  // Motor control    (S3->C3) -- reserved
+  kPacketStatus       = 3,  // Motor status     (C3->S3) -- reserved
+  kPacketIRControl    = 4,  // IR mode switch   (S3->C3)
+  kPacketIRStatus     = 5,  // IR sensor status (C3->S3)
+  kPacketColorStatus  = 6,  // Color status     (C3->S3)
+  kPacketColorControl = 7   // Color control    (S3->C3)
 };
 ```
 
-### IRControlPacket — Switch IR mode (S3 → C3)
+---
+
+### IRControlPacket -- Switch IR mode (S3 -> C3)
 
 ```cpp
 struct IRControlPacket {
@@ -76,7 +113,7 @@ struct IRControlPacket {
 
 **Size**: 2 bytes
 
-### IRStatusPacket — IR sensor reading (C3 → S3)
+### IRStatusPacket -- IR sensor reading (C3 -> S3)
 
 ```cpp
 struct IRStatusPacket {
@@ -88,24 +125,123 @@ struct IRStatusPacket {
 };
 ```
 
-**Size**: 5 bytes  
-**Analog**: reconstruct as `(analog_high << 8) | analog_low` (0–4095, 12-bit ADC)  
+**Size**: 5 bytes
+**Analog**: reconstruct as `(analog_high << 8) | analog_low` (0-4095, 12-bit ADC)
 **Sent**: immediately on state change + every 500 ms (periodic heartbeat)
+
+---
+
+### ColorControlPacket -- Color sensor command (S3 -> C3)
+
+```cpp
+struct ColorControlPacket {
+  uint8_t type;      // Always kPacketColorControl (7)
+  uint8_t command;   // 0=RGB, 1=Lux, 2=RGB+Lux, 3=LED on, 4=LED off
+};
+```
+
+**Size**: 2 bytes
+
+**Command values** (`ColorCommand` enum on C3):
+
+| Value | Name | Effect |
+|-------|------|--------|
+| 0 | `kColorCmdRGB` | Switch to RGB-only display mode |
+| 1 | `kColorCmdLux` | Switch to lux-only display mode |
+| 2 | `kColorCmdRGBLux` | Switch to RGB+Lux display mode (default) |
+| 3 | `kColorCmdLedOn` | Turn TCS34725 onboard LED on (GPIO4 HIGH) |
+| 4 | `kColorCmdLedOff` | Turn TCS34725 onboard LED off (GPIO4 LOW) |
+
+**Mode commands** (0-2) trigger an immediate status packet back to S3 (via `state_changed_`).
+**LED commands** (3-4) do **not** trigger a status packet -- they only toggle the LED pin.
+
+### ColorStatusPacket -- Color sensor reading (C3 -> S3)
+
+```cpp
+struct ColorStatusPacket {
+  uint8_t type;       // Always kPacketColorStatus (6)
+  uint8_t mode;       // 0=RGB, 1=Lux, 2=RGB+Lux
+  uint8_t r;          // IR-compensated red, normalized 0-255
+  uint8_t g;          // IR-compensated green, normalized 0-255
+  uint8_t b;          // IR-compensated blue, normalized 0-255
+  uint8_t lux_high;   // Lux >> 8
+  uint8_t lux_low;    // Lux & 0xFF
+};
+```
+
+**Size**: 7 bytes
+**Lux**: reconstruct as `(lux_high << 8) | lux_low`
+**RGB**: IR-compensated via DN40 algorithm, then normalized to 0-255 relative to the compensated clear channel
+**Sent**: immediately on significant change + every 500 ms (periodic heartbeat)
+**Change thresholds**: RGB channel differs by >8 counts, or lux differs by >10
+
+**S3 display format** (depends on `mode` field):
+
+| Mode | Output |
+|------|--------|
+| 0 (RGB) | `[Color] R:128 G:64 B:32` |
+| 1 (Lux) | `[Color] 450lx` |
+| 2 (RGB+Lux) | `[Color] R:128 G:64 B:32  450lx` |
+
+> **Note**: The sensor always reads all channels internally regardless of mode. The mode only controls what fields the S3 displays.
 
 ---
 
 ## File Reference
 
-### C3 Board — `C3/include/IRSensor.h`
+### C3 Board -- `C3/include/ColorSensor.h`
 
-Declares the `IRSensor` class, `IRMode` enum, and both packet structs (`IRControlPacket`, `IRStatusPacket`).
+Declares the `ColorSensor` class, `ColorMode`/`ColorCommand` enums, and both packet structs (`ColorControlPacket`, `ColorStatusPacket`).
 
 **To use**:
-1. Include from anywhere that needs IR types: `#include "IRSensor.h"`
-2. Construct with digital and analog pin numbers: `IRSensor sensor(digital_pin, analog_pin);`
-3. Call `sensor.init()` once in `setup()`.
-4. Call `sensor.update()` every loop iteration to refresh readings and set the state-changed flag.
-5. Use `sensor.checkAndClearStateChanged()` to consume the flag (returns `true` once per change).
+1. Include: `#include "ColorSensor.h"`
+2. Construct with I2C pins and LED pin: `ColorSensor sensor(sda, scl, led);`
+3. Call `sensor.init()` once in `setup()` -- returns `false` if TCS34725 not found.
+4. Call `sensor.update()` every loop iteration.
+5. Use `sensor.checkAndClearStateChanged()` to consume the flag.
+
+**Key API**:
+```cpp
+ColorSensor sensor(5, 6, 4);  // SDA: GPIO5, SCL: GPIO6, LED: GPIO4
+sensor.init();                  // Init I2C, TCS34725, LED pin (HIGH by default)
+sensor.update();                // Non-blocking read with autorange
+sensor.handleControl(cmd);      // Apply ColorControlPacket (mode or LED)
+sensor.getRed();                // 0-255, IR-compensated normalized
+sensor.getGreen();              // 0-255
+sensor.getBlue();               // 0-255
+sensor.getLux();                // DN40-calculated lux
+sensor.getMode();               // kColorRGB, kColorLux, or kColorRGBLux
+sensor.isSaturated();           // true if clear channel near saturation
+sensor.checkAndClearStateChanged(); // Consume state-changed flag
+```
+
+---
+
+### C3 Board -- `C3/src/ColorSensor.cpp`
+
+Implementation of `ColorSensor`. Contains autorange table, DN40 IR compensation, lux calculation, and LED control.
+
+**`init()`** -- Calls `Wire.begin(sda, scl)`, sets LED pin HIGH (on), initialises TCS34725 with first autorange entry (60x/614ms). Sets `state_changed_ = true` to force initial status send.
+
+**`update()`** -- Non-blocking: only reads when integration window has elapsed (minimum 200ms floor). Performs:
+1. `getRawData()` -- reads R/G/B/Clear 16-bit counts
+2. **Autorange** -- adjusts gain/integration if clear channel out of bounds, re-reads after settling
+3. **DN40 IR compensation** -- estimates IR component, subtracts from all channels
+4. **Saturation check** -- flags if near 75% of max count for short integrations
+5. **Lux calculation** -- `(R*0.136 + G*1.0 + B*-0.444) / CPL` where CPL = (integration_ms * gain) / (GA * DF)
+6. **RGB normalization** -- compensated R/G/B scaled to 0-255 relative to compensated clear
+7. **Change detection** -- sets `state_changed_` if any channel changes beyond threshold
+
+**`handleControl(cmd)`** -- Switches on command value:
+- Commands 0-2: Set `mode_` and flag `state_changed_` (triggers immediate status packet)
+- Command 3: `digitalWrite(led_pin_, HIGH)` -- LED on
+- Command 4: `digitalWrite(led_pin_, LOW)` -- LED off
+
+---
+
+### C3 Board -- `C3/include/IRSensor.h`
+
+Declares the `IRSensor` class, `IRMode` enum, and both packet structs (`IRControlPacket`, `IRStatusPacket`).
 
 **Key API**:
 ```cpp
@@ -114,77 +250,85 @@ sensor.init();                 // Configure pins for current mode (default: digi
 sensor.update();               // Read active pin, debounce, set state_changed_ flag
 sensor.handleControl(cmd);     // Apply an IRControlPacket (mode switch)
 sensor.isObstacle();           // true if DO was LOW after debounce
-sensor.getAnalogValue();       // Last analogRead() result (0–4095)
+sensor.getAnalogValue();       // Last analogRead() result (0-4095)
 sensor.getMode();              // kIRDigital or kIRAnalog
 sensor.checkAndClearStateChanged(); // Consume the state-changed flag
 ```
 
+> **Note**: IR sensor is not active in the current build -- removed from `main.cpp` while color sensor is being tested. GPIO4 is shared with color sensor LED.
+
 ---
 
-### C3 Board — `C3/src/IRSensor.cpp`
+### C3 Board -- `C3/src/IRSensor.cpp`
 
 Implementation of `IRSensor`. Contains the mode-exclusive reading logic.
 
-**`init()`** — Calls `activateDigitalMode()` (default). Sets GPIO4 as `INPUT`, GPIO3 as `INPUT` (high-Z).
+**`init()`** -- Calls `activateDigitalMode()` (default). Sets GPIO4 as `INPUT`, GPIO3 as `INPUT` (high-Z).
 
-**`update()`** — Branches on current mode:
+**`update()`** -- Branches on current mode:
 - *Digital*: `digitalRead(GPIO4)`. Raw value must be stable for 50 ms (debounce) before `obstacle_` updates and `state_changed_` is set.
 - *Analog*: `analogRead(GPIO3)`. If the new value differs from the previous by more than 50 counts, `state_changed_` is set.
 
-**`handleControl(cmd)`** — On mode change, calls `activateDigitalMode()` or `activateAnalogMode()` before updating the stored mode and setting `state_changed_`.
+**`handleControl(cmd)`** -- On mode change, calls `activateDigitalMode()` or `activateAnalogMode()` before updating the stored mode and setting `state_changed_`.
 
-**`activateDigitalMode()`** — Sets GPIO4 `INPUT`, GPIO3 `INPUT`. Stops ADC sampling.
+**`activateDigitalMode()`** -- Sets GPIO4 `INPUT`, GPIO3 `INPUT`. Stops ADC sampling.
 
-**`activateAnalogMode()`** — Sets GPIO4 `INPUT` (high-Z, releases DO line). `analogRead()` handles ADC channel setup automatically.
+**`activateAnalogMode()`** -- Sets GPIO4 `INPUT` (high-Z, releases DO line). `analogRead()` handles ADC channel setup automatically.
 
 ---
 
-### C3 Board — `C3/include/ESPNOW_C3.h`
+### C3 Board -- `C3/include/ESPNOW_C3.h`
 
-Public API for the C3 ESP-NOW transport layer. Uses forward declarations only — does **not** pull in subsystem headers.
+Public API for the C3 ESP-NOW transport layer. Uses forward declarations only -- does **not** pull in subsystem headers.
 
 **To use**: Include in any C3 file that needs to initialise or register subsystems.
 
 ```cpp
 #include "ESPNOW_C3.h"
 
-void espnow_init();                         // Initialise ESP-NOW, add S3 as peer
-void espnow_register_motor(MotorController *motor); // Register motor (unused if commented out)
-void espnow_register_ir(IRSensor *ir);      // Register IR sensor
-void espnow_update();                       // Call every loop — dispatches status packets
+void espnow_init();                              // Initialise ESP-NOW, add S3 as peer
+void espnow_register_motor(MotorController *m);  // Register motor subsystem
+void espnow_register_ir(IRSensor *ir);           // Register IR sensor
+void espnow_register_color(ColorSensor *cs);     // Register color sensor
+void espnow_update();                            // Call every loop -- dispatches status packets
 ```
 
-**Packet type enum** (`PacketType`) is defined here and shared by both `.h` files on C3.
+**Packet type enum** (`PacketType`) is defined here and shared by all `.h` files on C3. Forward declarations for `MotorController`, `IRSensor`, `ColorSensor`, `motorControlPacket`, `IRControlPacket`, `ColorControlPacket`.
 
 ---
 
-### C3 Board — `C3/src/ESPNOW_C3.cpp`
+### C3 Board -- `C3/src/ESPNOW_C3.cpp`
 
 Internal implementation of the C3 transport layer.
 
-**Registration pattern** — Each subsystem is registered via a pointer stored in a `namespace`-scoped variable (`g_motor`, `g_ir`). Subsystems that are `nullptr` are silently skipped.
+**Registration pattern** -- Each subsystem is registered via a pointer stored in a `namespace`-scoped variable (`g_motor`, `g_ir`, `g_color`). Subsystems that are `nullptr` are silently skipped.
 
-**`espnow_init()`** — Calls `esp_now_init()`, registers send/receive callbacks, and calls `ensureS3Peer()` to add the S3's MAC as a peer immediately.
+**`espnow_init()`** -- Calls `esp_now_init()`, registers send/receive callbacks, and calls `ensureS3Peer()` to add the S3's MAC as a peer immediately.
 
-**`espnow_update()`** — Called every loop. For each registered subsystem:
-- Calls `checkAndClearStateChanged()` — if `true`, sends a status packet immediately.
-- Checks the periodic timer — if elapsed, sends a status packet regardless of change.
+**`espnow_update()`** -- Called every loop. For each registered subsystem:
+- Calls `checkAndClearStateChanged()` -- if `true`, sends a status packet immediately.
+- Checks the periodic timer -- if elapsed, sends a status packet regardless of change.
 
-**`sendIRStatus()`** — Builds an `IRStatusPacket` from `g_ir`'s getters and calls `esp_now_send()` to the S3 MAC.
+**Status senders**:
+- `sendMotorStatus()` -- Builds `StatusPacket` from `g_motor`'s getters
+- `sendIRStatus()` -- Builds `IRStatusPacket` from `g_ir`'s getters
+- `sendColorStatus()` -- Builds `ColorStatusPacket` from `g_color`'s getters (includes `mode` field)
 
-**`onDataRecv()`** — Dispatches incoming packets by `type` byte:
-- `kPacketControl` → `g_motor->handleControl()`
-- `kPacketIRControl` → `g_ir->handleControl()`
+**`onDataRecv()`** -- Dispatches incoming packets by `type` byte:
+- `kPacketControl` (2) -> `g_motor->handleControl()`
+- `kPacketIRControl` (4) -> `g_ir->handleControl()`
+- `kPacketColorControl` (7) -> `g_color->handleControl()`
 
 **Periodic intervals**:
 | Subsystem | Interval |
 |-----------|----------|
 | Motor status | Every 5000 ms |
 | IR status | Every 500 ms |
+| Color status | Every 500 ms |
 
 ---
 
-### C3 Board — `C3/src/main.cpp`
+### C3 Board -- `C3/src/main.cpp`
 
 Entry point. Declares subsystem objects and calls init/register/update functions.
 
@@ -197,89 +341,136 @@ Entry point. Declares subsystem objects and calls init/register/update functions
 
 **Current state**:
 ```cpp
-IRSensor ir_sensor1(4, 3);   // GPIO4 = DO, GPIO3 = AO
-// MotorController motor;    // Commented out — re-enable when motor is wired
+// MotorController motor;              // Commented out -- re-enable when motor is wired
+ColorSensor color_sensor(5, 6, 4);     // SDA: GPIO5, SCL: GPIO6, LED: GPIO4
+// IR sensor removed while color sensor testing (GPIO4 conflict)
 ```
 
 ---
 
-### S3 Board — `S3/include/ESPNOW_S3.h`
+### S3 Board -- `S3/include/ESPNOW_S3.h`
 
-Public API for the S3 ESP-NOW transport layer. Declares the same `IRControlPacket` and `IRStatusPacket` structs as the C3 side (must stay in sync).
+Public API for the S3 ESP-NOW transport layer. Declares the same packet structs as the C3 side (must stay in sync).
+
+Packet structs defined here: `IRControlPacket`, `IRStatusPacket`, `ColorControlPacket`, `ColorStatusPacket`.
 
 **To use**:
 ```cpp
 #include "ESPNOW_S3.h"
 
-void espnow_init_sender(const uint8_t *target_mac); // Init and add C3 as peer
-void espnow_send_ir_control(uint8_t mode);          // Send IRControlPacket (0=digital, 1=analog)
-void espnow_process();                              // Call every loop — prints buffered status
+void espnow_init_sender(const uint8_t *target_mac);  // Init and add C3 as peer
+void espnow_send_ir_control(uint8_t mode);            // Send IRControlPacket (0=digital, 1=analog)
+void espnow_send_color_control(uint8_t command);      // Send ColorControlPacket (0-4)
+void espnow_process();                                // Call every loop -- prints buffered status
 ```
 
 ---
 
-### S3 Board — `S3/src/ESPNOW_S3.cpp`
+### S3 Board -- `S3/src/ESPNOW_S3.cpp`
 
 Implementation of the S3 transport layer.
 
-**`espnow_init_sender(mac)`** — Initialises ESP-NOW, registers send/receive callbacks, adds C3's MAC as a peer.
+**`espnow_init_sender(mac)`** -- Initialises ESP-NOW, registers send/receive callbacks, adds C3's MAC as a peer.
 
-**`onDataRecv()`** — Runs in the Wi-Fi task (not `loop()`). **Never call `Serial.print()` directly here** — it will be interrupted and produce truncated output. Instead, formats the output string into a fixed buffer with `snprintf()` and sets a `volatile bool g_ir_new` flag.
+**`onDataRecv()`** -- Runs in the Wi-Fi task (not `loop()`). **Never call `Serial.print()` directly here** -- it will be interrupted and produce truncated output. Instead, formats the output string into fixed buffers with `snprintf()` and sets volatile flags.
 
-**`espnow_process()`** — Called from `loop()`. Checks `g_ir_new`; if set, clears it and calls `Serial.println(g_ir_line)`. This guarantees the full string prints without interruption.
+**Receive buffers**:
+| Buffer | Flag | Source Packet |
+|--------|------|---------------|
+| `g_ir_line[32]` | `g_ir_new` | `IRStatusPacket` |
+| `g_color_line[48]` | `g_color_new` | `ColorStatusPacket` |
 
-**Serial output format**:
-| Mode | Output |
-|------|--------|
-| Digital — obstacle | `[IR] OBSTACLE` |
-| Digital — clear | `[IR] Clear` |
-| Analog | `[IR] analog: 2048` |
+**`espnow_process()`** -- Called from `loop()`. Checks each flag; if set, clears it and calls `Serial.println()` on the corresponding buffer.
+
+**`espnow_send_ir_control(mode)`** -- Builds and sends `IRControlPacket {4, mode}`.
+
+**`espnow_send_color_control(command)`** -- Builds and sends `ColorControlPacket {7, command}`.
+
+**Serial output formats**:
+| Packet | Mode | Output |
+|--------|------|--------|
+| IR | Digital -- obstacle | `[IR] OBSTACLE` |
+| IR | Digital -- clear | `[IR] Clear` |
+| IR | Analog | `[IR] analog: 2048` |
+| Color | 0 (RGB) | `[Color] R:128 G:64 B:32` |
+| Color | 1 (Lux) | `[Color] 450lx` |
+| Color | 2 (RGB+Lux) | `[Color] R:128 G:64 B:32  450lx` |
 
 ---
 
-### S3 Board — `S3/src/main.cpp`
+### S3 Board -- `S3/src/main.cpp`
 
 Entry point for the S3. Handles serial command input and calls `espnow_process()` to print incoming status.
 
 **Available commands** (typed into serial monitor):
-| Command | Effect |
-|---------|--------|
-| `digital` | Sends `IRControlPacket {4, 0}` — switch C3 to digital mode |
-| `analog` | Sends `IRControlPacket {4, 1}` — switch C3 to analog mode |
+
+| Command | Packet Sent | Effect |
+|---------|-------------|--------|
+| `digital` | `IRControlPacket {4, 0}` | Switch C3 IR to digital mode |
+| `analog` | `IRControlPacket {4, 1}` | Switch C3 IR to analog mode |
+| `c` | `ColorControlPacket {7, 0}` | Switch color to RGB-only display |
+| `l` | `ColorControlPacket {7, 1}` | Switch color to lux-only display |
+| `cl` | `ColorControlPacket {7, 2}` | Switch color to RGB+Lux display |
+| `ledon` | `ColorControlPacket {7, 3}` | Turn color sensor LED on |
+| `ledoff` | `ColorControlPacket {7, 4}` | Turn color sensor LED off |
 
 **Loop structure**:
 ```
 loop()
-  ├── espnow_process()     → print any buffered IR status from C3
-  └── Serial.available()   → read command, send IRControlPacket
+  +-- espnow_process()     -> print any buffered IR/Color status from C3
+  +-- Serial.available()   -> read command, send control packet
 ```
 
 ---
 
 ## Message Flow
 
-### Mode Switch (S3 → C3 → S3)
+### IR Mode Switch (S3 -> C3 -> S3)
 ```
 S3: User types "analog"
-S3: espnow_send_ir_control(1) → IRControlPacket {4, 1}
+S3: espnow_send_ir_control(1) -> IRControlPacket {4, 1}
 
-C3: onDataRecv() → g_ir->handleControl(cmd)
-C3: activateAnalogMode() — GPIO4 goes high-Z, ADC enabled on GPIO3
+C3: onDataRecv() -> g_ir->handleControl(cmd)
+C3: activateAnalogMode() -- GPIO4 goes high-Z, ADC enabled on GPIO3
 C3: state_changed_ = true
-C3: espnow_update() detects flag → sendIRStatus()
-    → IRStatusPacket {5, 1, obstacle, analog_high, analog_low}
+C3: espnow_update() detects flag -> sendIRStatus()
+    -> IRStatusPacket {5, 1, obstacle, analog_high, analog_low}
 
-S3: onDataRecv() → snprintf("[IR] analog: XXXX") → g_ir_new = true
-S3: loop() → espnow_process() → Serial.println("[IR] analog: XXXX")
+S3: onDataRecv() -> snprintf("[IR] analog: XXXX") -> g_ir_new = true
+S3: loop() -> espnow_process() -> Serial.println("[IR] analog: XXXX")
 ```
 
-### Periodic IR Status (every 500 ms)
+### Color Mode Switch (S3 -> C3 -> S3)
 ```
-C3: espnow_update() timer fires
-C3: sendIRStatus() — reads current mode/state from g_ir
-C3: Sends IRStatusPacket to S3
+S3: User types "c"
+S3: espnow_send_color_control(0) -> ColorControlPacket {7, 0}
 
-S3: Receives, formats, prints from loop()
+C3: onDataRecv() -> g_color->handleControl(cmd)
+C3: mode_ = kColorRGB, state_changed_ = true
+C3: espnow_update() detects flag -> sendColorStatus()
+    -> ColorStatusPacket {6, 0, r, g, b, lux_high, lux_low}
+
+S3: onDataRecv() -> mode==0 -> snprintf("[Color] R:%d G:%d B:%d")
+S3: loop() -> espnow_process() -> Serial.println("[Color] R:128 G:64 B:32")
+```
+
+### Color LED Control (S3 -> C3, no response)
+```
+S3: User types "ledoff"
+S3: espnow_send_color_control(4) -> ColorControlPacket {7, 4}
+
+C3: onDataRecv() -> g_color->handleControl(cmd)
+C3: digitalWrite(led_pin_, LOW) -- LED turns off
+C3: (no state_changed_ flag set -- no status packet sent)
+```
+
+### Periodic Status (every 500 ms)
+```
+C3: espnow_update() timer fires for each registered subsystem
+C3: sendIRStatus() / sendColorStatus() -- reads current state from subsystem
+C3: Sends packet to S3
+
+S3: Receives, formats into buffer, prints from loop()
 ```
 
 ---
@@ -291,18 +482,39 @@ S3: Receives, formats, prints from loop()
 | Max packet size | 250 bytes (ESP-NOW limit) |
 | Typical latency | < 10 ms |
 | IR status interval | 500 ms + on change |
+| Color status interval | 500 ms + on change |
 | Motor status interval | 5000 ms + on change |
 | Encryption | Disabled |
 | Retransmission | None (fire-and-forget) |
 
 ---
 
+## PlatformIO Dependencies
+
+### C3 (`C3/platformio.ini`)
+```ini
+lib_deps =
+    adafruit/Adafruit NeoPixel@^1.12.0
+    adafruit/Adafruit TCS34725@^1.4.2
+    adafruit/Adafruit BusIO@^1.16.1
+```
+
+### S3 (`S3/platformio.ini`)
+```ini
+lib_deps =
+    adafruit/Adafruit NeoPixel@^1.12.0
+```
+
+---
+
 ## Known Limitations
 
-1. **Simultaneous DO+AO reading causes interference** — solved by mode-exclusive pin reading (see design decision above).
-2. **GPIO10 is unusable on ESP32-C3-MINI-1** — tied to SPI flash; any `digitalRead()` on it will always return the same state regardless of external signal.
-3. **Single peer** — S3 is hardcoded to one C3 MAC and vice versa.
-4. **No packet loss detection** — packets are fire-and-forget with no sequence numbers or ACK beyond the ESP-NOW layer's `onDataSent` callback.
+1. **Simultaneous DO+AO reading causes interference** -- solved by mode-exclusive pin reading (see design decision above).
+2. **GPIO10 is unusable on ESP32-C3-MINI-1** -- tied to SPI flash; any `digitalRead()` on it will always return the same state regardless of external signal.
+3. **GPIO4 pin conflict** -- used by both IR sensor (digital output) and color sensor (LED control). Only one can be active at a time; IR is currently removed from `main.cpp`.
+4. **Single peer** -- S3 is hardcoded to one C3 MAC and vice versa.
+5. **No packet loss detection** -- packets are fire-and-forget with no sequence numbers or ACK beyond the ESP-NOW layer's `onDataSent` callback.
+6. **Color sensor always reads all channels** -- mode only affects what the S3 displays, not what the C3 samples. All R/G/B/Lux values are always present in the status packet.
 
 ---
 
@@ -312,315 +524,14 @@ To add a new sensor (e.g. ultrasonic, temperature) following the same pattern:
 
 **C3 side**:
 1. Create `MySensor.h` / `MySensor.cpp` with `init()`, `update()`, `handleControl()`, `checkAndClearStateChanged()`.
-2. Add new packet type values to the `PacketType` enum in `ESPNOW_C3.h`.
+2. Define control/status packet structs in `MySensor.h` and assign new `PacketType` values in `ESPNOW_C3.h`.
 3. Add `espnow_register_mysensor(MySensor *s)` to `ESPNOW_C3.h`.
 4. In `ESPNOW_C3.cpp`: add `g_mysensor` pointer, `sendMySensorStatus()`, dispatch in `onDataRecv()`, periodic timer in `espnow_update()`.
 5. In `main.cpp`: declare instance, call `init()`, call `espnow_register_mysensor()`, call `update()` in loop.
 
 **S3 side**:
 1. Add matching packet structs to `ESPNOW_S3.h`.
-2. Add dispatch branch in `onDataRecv()` in `ESPNOW_S3.cpp` using the same snprintf-buffer pattern.
-3. Add command handling in `main.cpp`.
+2. Add `espnow_send_mysensor_control()` function in `ESPNOW_S3.h`/`.cpp`.
+3. Add dispatch branch in `onDataRecv()` in `ESPNOW_S3.cpp` using the same snprintf-buffer pattern.
+4. Add command handling in `main.cpp`.
 
-│ (Command Interface)              │ (Control Systems)│
-│                 │                │                 │
-│ MAC: 30:ED:A0:  │  Commands      │ MAC: A0:76:4E:  │
-│      27:8F:A4   │◄───────────────│      7B:9A:B4   │
-│                 │                │                 │
-│                 │  Status        │                 │
-│                 │────────────────►│                 │
-└─────────────────┘                └─────────────────┘
-```
-
-## Communication Direction
-
-- **S3 → C3**: Sends commands (motor control, IR sensor control)
-- **C3 → S3**: Sends status (motor state, IR sensor state)
-- **Bidirectional**: Full duplex communication
-
-## Packet Structure
-
-### Packet Types Enum
-```c
-enum PacketType : uint8_t {
-  kPacketText      = 1,  // Text message
-  kPacketControl   = 2,  // Motor control (S3→C3)
-  kPacketStatus    = 3,  // Motor status (C3→S3)
-  kPacketIRControl = 4,  // IR sensor control (S3→C3)
-  kPacketIRStatus  = 5   // IR sensor status (C3→S3)
-};
-```
-
-### 1. TextPacket Structure
-
-**Purpose**: Send text messages for debugging/communication
-
-```c
-struct TextPacket {
-  uint8_t type;           // Always kPacketText (1)
-  char text[240];         // Text payload (null-terminated)
-};
-```
-
-**Size**: 241 bytes total
-**Usage**: Debugging, status messages, user commands as text
-
-### 2. ControlPacket Structure (Motor)
-
-**Purpose**: Motor control commands
-
-```c
-struct ControlPacket {
-  uint8_t type;           // Always kPacketControl (2)
-  uint8_t duty_cycle;     // PWM duty cycle (35-90%)
-  uint8_t direction;      // 0=reverse, 1=forward
-  uint8_t enable;         // 0=stop, 1=run
-};
-```
-
-**Size**: 4 bytes total
-**Usage**: Motor speed, direction, and enable/disable control
-
-### 3. StatusPacket Structure (Motor)
-
-**Purpose**: Motor status feedback from C3
-
-```c
-struct StatusPacket {
-  uint8_t type;           // Always kPacketStatus (3)
-  uint8_t duty_cycle;     // Current actual duty cycle
-  uint8_t direction;      // 0=reverse, 1=forward
-  uint8_t enable;         // 0=disabled, 1=enabled
-};
-```
-
-**Size**: 4 bytes total
-**Sent**: On state change (immediate) + every 5 seconds (periodic)
-
-### 4. IRControlPacket Structure
-
-**Purpose**: IR sensor mode control (digital vs analog output)
-
-```c
-struct IRControlPacket {
-  uint8_t type;           // Always kPacketIRControl (4)
-  uint8_t mode;           // 0=digital, 1=analog
-};
-```
-
-**Size**: 2 bytes total
-**Usage**: Switch IR sensor between binary (obstacle/clear) and analog (distance) modes
-
-### 5. IRStatusPacket Structure
-
-**Purpose**: IR sensor status feedback from C3
-
-```c
-struct IRStatusPacket {
-  uint8_t type;           // Always kPacketIRStatus (5)
-  uint8_t mode;           // 0=digital, 1=analog (current mode)
-  uint8_t digital_state;  // 0=clear, 1=obstacle
-  uint8_t analog_high;    // analog value >> 8 (high byte)
-  uint8_t analog_low;     // analog value & 0xFF (low byte)
-};
-```
-
-**Size**: 5 bytes total
-**Sent**: On state change (immediate) + every 500ms (periodic)
-**Analog Value**: Reconstructed as `(analog_high << 8) | analog_low` (0-4095 on ESP32-C3 12-bit ADC)
-
-## S3 Board (Transmitter) Behavior
-
-### MAC Address Configuration
-- **Target MAC**: `A0:76:4E:7B:9A:B4` (Hardcoded C3 MAC address)
-- **Own MAC**: `30:ED:A0:27:8F:A4` (Dynamic, shown in serial output)
-
-### Transmission Method
-```c
-esp_now_send(kC3MacAddr, reinterpret_cast<uint8_t*>(&packet), sizeof(packet));
-```
-
-### Command Processing
-The S3 processes serial commands and converts them to packets:
-
-| Serial Command | Packet Type | Details |
-|---|---|---|
-| `"forward"` | ControlPacket | `{2, current_duty, 1, 1}` |
-| `"reverse"` | ControlPacket | `{2, current_duty, 0, 1}` |
-| `"stop"` | ControlPacket | `{2, current_duty, x, 0}` |
-| `"0"-"100"` | ControlPacket | `{2, value, current_dir, 1}` |
-| `"digital"` | IRControlPacket | `{4, 0}` — Switch to digital (binary) mode |
-| `"analog"` | IRControlPacket | `{4, 1}` — Switch to analog (distance) mode |
-| Text messages | TextPacket | `{1, "message"}` |
-
-### Default Control State
-```c
-ControlPacket g_control{ kPacketControl, 50, 1, 1 };
-// Type: 2, Duty: 50%, Direction: Forward, Enabled: True
-```
-
-## C3 Board (Receiver/Status Reporter) Behavior
-
-### MAC Address
-- **Own MAC**: `A0:76:4E:7B:9A:B4` (Must match S3's target address)
-
-### Packet Reception Handler
-```c
-void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
-```
-
-### Processing Logic
-
-#### TextPacket Processing
-1. Check if `type == kPacketText (1)`
-2. Copy data safely with bounds checking
-3. Null-terminate text for safety
-4. Print to serial: `"RX from [MAC] | [text]"`
-
-#### MotorControlPacket Processing  
-1. Check if `type == kPacketControl (2)` and `len >= sizeof(motorControlPacket)`
-2. Copy packet data
-3. Apply motor control via `motor->handleControl(cmd)`
-4. Motor updates ramped over time, status sent on state change
-
-#### IRControlPacket Processing
-1. Check if `type == kPacketIRControl (4)` and `len >= sizeof(IRControlPacket)`
-2. Copy packet data
-3. Apply mode change via `ir->handleControl(cmd)`
-4. IR state sent immediately on mode change
-
-### Status Broadcasting (C3 → S3)
-
-C3 sends status packets to S3 under two conditions:
-
-**Motor Status (every 5 seconds + on state change)**:
-- After `motor.update()` detects a state change
-```c
-espnow_send_status(motor);  // Sends StatusPacket
-```
-
-**IR Status (every 500ms + on significant change)**:
-- After `ir.update()` detects obstacle state change or analog value shift > ±50/4095
-```c
-espnow_send_ir_status(ir);  // Sends IRStatusPacket
-```
-
-## Message Flow Examples
-
-### Motor Control Message Flow
-```
-S3: User types "forward"
-S3: Creates ControlPacket {2, 50, 1, 1}
-S3: esp_now_send() → status: OK
-
-C3: onDataRecv() receives packet
-C3: Identifies kPacketControl
-C3: motor.handleControl(cmd) initiates ramp-up
-C3: In loop(): motor.update() applies ramping
-C3: Motor state changes → state_changed_ flag set
-C3: espnow_update() detects flag, sends StatusPacket {3, actual_duty, 1, 1}
-
-S3: onDataRecv() receives StatusPacket
-S3: Parses and displays: "[MOTOR] duty=X dir=FWD enable=ON"
-```
-
-### IR Mode Switch Message Flow
-```
-S3: User types "analog"
-S3: Creates IRControlPacket {4, 1}
-S3: esp_now_send() → status: OK
-
-C3: onDataRecv() receives packet
-C3: Identifies kPacketIRControl
-C3: ir.handleControl(cmd) sets mode to kIRAnalog
-C3: state_changed_ flag set
-C3: espnow_update() detects flag, sends IRStatusPacket
-    {5, 1, digital_state, analog_high, analog_low}
-
-S3: onDataRecv() receives IRStatusPacket
-S3: Reconstructs analog_value = (high<<8)|low
-S3: Displays: "[IR] mode=ANALOG digital=X analog=YYYY"
-```
-
-### IR Periodic Status Flow
-```
-C3: Loop runs every 10ms
-C3: ir_sensor1.update() reads both GPIO10 (digital) and GPIO2 (analog)
-C3: Detects analog change > ±50 → state_changed_ flag set
-C3: espnow_update() runs, timer >= 500ms → sends IRStatusPacket
-
-S3: Receives packet, displays latest IR state
-```
-
-### Text Message Flow
-```
-S3: User types "hello world" (not a recognized command)
-S3: Creates TextPacket {1, "hello world"}
-S3: esp_now_send() → status: OK
-
-C3: onDataRecv() receives packet
-C3: Identifies kPacketText
-C3: Prints "RX from 30:ED:A0:27:8F:A4 | hello world"
-```
-
-## Protocol Characteristics
-
-### Reliability
-- **Status Confirmation**: S3 receives `ESP_NOW_SEND_SUCCESS` or `ESP_NOW_SEND_FAIL`
-- **No ACK**: Current implementation is fire-and-forget
-- **Packet Loss**: No retransmission mechanism
-
-### Performance  
-- **Range**: Up to 50-200 meters (depending on obstacles)
-- **Latency**: < 10ms typical
-- **Bandwidth**: 250 bytes max per packet, ~1MB/s theoretical
-
-### Security
-- **Encryption**: Currently disabled (`peer_info.encrypt = false`)
-- **Authentication**: MAC address filtering only
-
-## Limitations & Future Improvements
-
-### Current Limitations
-1. **Single Target**: S3 can only communicate with one hardcoded C3
-2. **No Text Feedback from C3**: C3 doesn't reply with text packets
-3. **No Error Counters**: Lost packets not tracked
-4. **Analog Granularity**: 16-bit analog transmitted in 2 bytes—adequate for 12-bit ADC
-
-### Potential Enhancements
-1. **Dynamic MAC Discovery**: Automatic peer discovery via broadcast beacon
-2. **Packet Sequencing**: Add sequence numbers for ordering guarantees
-3. **Multiple Sensors**: Support more than one IR sensor, combine status packets
-4. **Encryption**: Enable ESP-NOW encryption for security
-5. **Subsystem Abstraction**: Generic packet handler for pluggable components
-6. **Configuration Persistence**: Store calibration offsets on C3 EEPROM
-
-## Debugging Information
-
-### S3 Serial Output Examples
-```
-S3 MAC Address: 30:ED:A0:27:8F:A4
-
-=== Motor Commands ===
-forward, reverse, stop, 0-100 (duty %)
-
-=== IR Sensor Commands ===
-digital, analog
-
-[MOTOR] duty=50 dir=FWD enable=ON
-[MOTOR] duty=75 dir=FWD enable=ON
-[IR] mode=DIGITAL digital=CLEAR analog=412
-[IR] mode=DIGITAL digital=OBSTACLE analog=3890
-[IR] mode=ANALOG digital=CLEAR analog=412
-```
-
-### C3 Serial Output Examples (Debugging)
-```
-C3 ready for motor control via ESP-NOW.
-C3 ESP-NOW ready (motor + IR).
-```
-
-**C3 Only Prints on RX (if text packets are sent):**
-```
-RX from 30:ED:A0:27:8F:A4 | debug message
-```
