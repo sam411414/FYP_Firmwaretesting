@@ -109,19 +109,54 @@ When the clear channel count exceeds `max_count`, the index moves up (less sensi
 
 ---
 
+## Communication Pattern — Hybrid Poll + On-Change
+
+The S3 hub uses a **hybrid** strategy:
+
+1. **Polling (regular)**: The S3 iterates through slots 1-5, sending a `kPacketPoll` to each. The C3 responds immediately with its current status. If no response within 30 ms, the device is marked offline and the hub advances to the next slot. A full cycle takes ~50-75 ms (~13-20 Hz).
+
+2. **On-change (urgent)**: If a C3 detects a significant state change (e.g., IR obstacle detected, motor state changed via command), it pushes an unsolicited status packet immediately without waiting for the next poll. The S3 accepts and processes these between poll cycles.
+
+This gives predictable refresh rates via polling, plus low-latency change detection via on-change pushes.
+
+### Poll Cycle Timing
+
+| Parameter | Value |
+|-----------|-------|
+| Poll timeout (per device) | 30 ms |
+| Inter-device gap | 2 ms |
+| Full cycle (5 devices, all online) | ~50-75 ms |
+| Effective refresh rate | ~13-20 Hz |
+| Change notification latency | < 10 ms (unsolicited push) |
+
+---
+
 ## Packet Types
 
 ```cpp
 enum PacketType : uint8_t {
-  kPacketText         = 1,  // Text message (unused in current build)
+  kPacketText         = 1,  // Text message (unused)
   kPacketControl      = 2,  // Motor control    (S3->C3)
   kPacketStatus       = 3,  // Motor status     (C3->S3)
   kPacketIRControl    = 4,  // IR mode switch   (S3->C3)
   kPacketIRStatus     = 5,  // IR sensor status (C3->S3)
   kPacketColorStatus  = 6,  // Color status     (C3->S3)
-  kPacketColorControl = 7   // Color control    (S3->C3)
+  kPacketColorControl = 7,  // Color control    (S3->C3)
+  kPacketMacAddr      = 8,  // MAC announce     (reserved)
+  kPacketPoll         = 9   // Poll request     (S3->C3)
 };
 ```
+
+### PollPacket — Poll request (S3 -> C3)
+
+```cpp
+struct PollPacket {
+  uint8_t type;   // Always kPacketPoll (9)
+};
+```
+
+**Size**: 1 byte
+**Behaviour on C3**: Immediately responds with the status packet for its registered subsystem (motor, IR, or color).
 
 ---
 
@@ -154,12 +189,11 @@ struct MotorStatusPacket {
 
 **Size**: 6 bytes
 **RPM**: reconstruct as `(rpm_high << 8) | rpm_low`
-**Sent**: immediately on state change + every 1000 ms (periodic heartbeat)
+**Sent**: On poll response + on state change (unsolicited push)
 
-**S3 display format**:
-```
-[Motor] 75% FWD ON 250RPM
-[Motor] 0% FWD OFF 0RPM
+**S3 JSON output**:
+```json
+{"slot":3,"type":"motor","online":true,"duty":75,"dir":1,"en":1,"rpm":250}
 ```
 
 ---
@@ -189,7 +223,7 @@ struct IRStatusPacket {
 
 **Size**: 5 bytes
 **Analog**: reconstruct as `(analog_high << 8) | analog_low` (0-4095, 12-bit ADC)
-**Sent**: immediately on state change + every 500 ms (periodic heartbeat)
+**Sent**: On poll response + on state change (unsolicited push)
 
 ---
 
@@ -234,16 +268,13 @@ struct ColorStatusPacket {
 **Size**: 7 bytes
 **Lux**: reconstruct as `(lux_high << 8) | lux_low`
 **RGB**: IR-compensated via DN40 algorithm, then normalized to 0-255 relative to the compensated clear channel
-**Sent**: immediately on significant change + every 500 ms (periodic heartbeat)
+**Sent**: On poll response + on significant change (unsolicited push)
 **Change thresholds**: RGB channel differs by >8 counts, or lux differs by >10
 
-**S3 display format** (depends on `mode` field):
-
-| Mode | Output |
-|------|--------|
-| 0 (RGB) | `[Color] R:128 G:64 B:32` |
-| 1 (Lux) | `[Color] 450lx` |
-| 2 (RGB+Lux) | `[Color] R:128 G:64 B:32  450lx` |
+**S3 JSON output**:
+```json
+{"slot":1,"type":"color","online":true,"mode":2,"r":128,"g":64,"b":32,"lux":450}
+```
 
 > **Note**: The sensor always reads all channels internally regardless of mode. The mode only controls what fields the S3 displays.
 
@@ -450,10 +481,10 @@ void espnow_init();                              // Initialise ESP-NOW, add S3 a
 void espnow_register_motor(MotorController *m);  // Register motor subsystem
 void espnow_register_ir(IRSensor *ir);           // Register IR sensor
 void espnow_register_color(ColorSensor *cs);     // Register color sensor
-void espnow_update();                            // Call every loop -- dispatches status packets
+void espnow_update();                            // Call every loop -- on-change status
 ```
 
-**Packet type enum** (`PacketType`) is defined here and shared by all `.h` files on C3. Forward declarations for `MotorController`, `IRSensor`, `ColorSensor`, `motorControlPacket`, `IRControlPacket`, `ColorControlPacket`.
+**Packet type enum** (`PacketType`) is defined here and shared by all `.h` files on C3. Includes `kPacketPoll = 9` for poll requests from the S3 hub. Forward declarations for `MotorController`, `IRSensor`, `ColorSensor`, `motorControlPacket`, `IRControlPacket`, `ColorControlPacket`.
 
 ---
 
@@ -466,8 +497,8 @@ Internal implementation of the C3 transport layer.
 **`espnow_init()`** -- Calls `esp_now_init()`, registers send/receive callbacks, and calls `ensureS3Peer()` to add the S3's MAC as a peer immediately.
 
 **`espnow_update()`** -- Called every loop. For each registered subsystem:
-- Calls `checkAndClearStateChanged()` -- if `true`, sends a status packet immediately.
-- Checks the periodic timer -- if elapsed, sends a status packet regardless of change.
+- Calls `checkAndClearStateChanged()` -- if `true`, sends a status packet immediately (on-change push).
+- Periodic timers have been removed -- the S3 hub polls for regular updates.
 
 **Status senders**:
 - `sendMotorStatus()` -- Builds `MotorStatusPacket` from `g_motor`'s getters (includes RPM via `getRPM()`)
@@ -475,22 +506,26 @@ Internal implementation of the C3 transport layer.
 - `sendColorStatus()` -- Builds `ColorStatusPacket` from `g_color`'s getters (includes `mode` field)
 
 **`onDataRecv()`** -- Dispatches incoming packets by `type` byte:
+- `kPacketPoll` (9) -> Immediately sends status for all registered subsystems (poll response)
 - `kPacketControl` (2) -> `g_motor->handleControl()`
 - `kPacketIRControl` (4) -> `g_ir->handleControl()`
 - `kPacketColorControl` (7) -> `g_color->handleControl()`
-
-**Periodic intervals**:
-| Subsystem | Interval |
-|-----------|----------|
-| Motor status | Every 1000 ms |
-| IR status | Every 500 ms |
-| Color status | Every 500 ms |
 
 ---
 
 ### C3 Board -- `C3/src/main.cpp`
 
 Entry point. Declares subsystem objects and calls init/register/update functions.
+
+In the multi-peripheral architecture, each physical C3 board runs one of the example harness files (renamed to `main.cpp`):
+
+| File | Subsystem | Typical board |
+|------|-----------|---------------|
+| `motorExample.txt` | Motor + Encoder | Slot 3, 5 |
+| `IRSensorExample.txt` | IR Sensor | Slot 2, 4 |
+| `colourSensorExample.txt` | Color Sensor (TCS34725) | Slot 1 |
+
+**To deploy a C3**: Copy the appropriate example.txt to `src/main.cpp`, build, and upload.
 
 **To add a new subsystem**:
 1. Include its `.h` file.
@@ -499,209 +534,186 @@ Entry point. Declares subsystem objects and calls init/register/update functions
 4. Register it: `espnow_register_xxx(&instance)`.
 5. Call `instance.update()` in `loop()`.
 
-**Current state**:
-```cpp
-MotorController motor;
-Encoder encoder(kEncoderPinA, kEncoderPinB);  // GPIO0 = Phase A, GPIO1 = Phase B
-ColorSensor color_sensor(5, 6, 4);             // SDA: GPIO5, SCL: GPIO6, LED: GPIO4
-// IR sensor removed while color sensor testing (GPIO4 conflict)
-```
-
 ---
 
 ### S3 Board -- `S3/include/ESPNOW_S3.h`
 
-Public API for the S3 ESP-NOW transport layer. Declares the same packet structs as the C3 side (must stay in sync).
+Public API for the S3 hub transport layer. Defines the peripheral registry, all packet structs, and the hub API.
 
-Packet structs defined here: `motorControlPacket`, `MotorStatusPacket`, `IRControlPacket`, `IRStatusPacket`, `ColorControlPacket`, `ColorStatusPacket`.
+**Key types**:
+- `PeripheralType` enum: `kPeripheralMotor`, `kPeripheralIR`, `kPeripheralColor`
+- `DeviceConfig` struct: MAC address + type (used in `kDeviceList[]`)
+- `PollPacket` struct: 1-byte poll request
+- All control/status packet structs (must stay in sync with C3)
+
+**Peripheral registry**: `kDeviceList[kNumDevices]` -- compile-time array of `DeviceConfig`. Edit this to add/remove/reorder C3 boards.
 
 **To use**:
 ```cpp
 #include "ESPNOW_S3.h"
 
-void espnow_init_sender(const uint8_t *target_mac);  // Init and add C3 as peer
-void espnow_send_motor_control(uint8_t duty, uint8_t direction, uint8_t enable);  // Send motorControlPacket
-void espnow_send_ir_control(uint8_t mode);            // Send IRControlPacket (0=digital, 1=analog)
-void espnow_send_color_control(uint8_t command);      // Send ColorControlPacket (0-4)
-void espnow_process();                                // Call every loop -- prints buffered status
+void espnow_hub_init();                                          // Init ESP-NOW, add all peers
+void espnow_hub_process();                                       // Poll FSM + JSON output
+void espnow_send_motor_cmd(uint8_t slot, uint8_t duty, uint8_t dir, uint8_t enable);
+void espnow_send_ir_cmd(uint8_t slot, uint8_t mode);
+void espnow_send_color_cmd(uint8_t slot, uint8_t command);
+PeripheralType espnow_get_device_type(uint8_t slot);             // Lookup type by slot
+bool espnow_is_device_online(uint8_t slot);                      // Liveness check
+void espnow_print_registry();                                    // Print device table
 ```
 
 ---
 
 ### S3 Board -- `S3/src/ESPNOW_S3.cpp`
 
-Implementation of the S3 transport layer with motor state verification.
+Implementation of the S3 hub transport layer with round-robin polling and JSON output.
 
-**`espnow_init_sender(mac)`** -- Initialises ESP-NOW, registers send/receive callbacks, adds C3's MAC as a peer.
+**`espnow_hub_init()`** -- Initialises ESP-NOW, registers callbacks, adds all `kNumDevices` C3 boards as peers.
 
-**Motor state verification** (added Feb 2026):
-- Struct `MotorExpected` stores commanded state: duty, direction, enable, sent_time, resend_count, pending flag
-- New function `espnow_set_motor_expected(duty, dir, en)` arms verification:
-  - Stores expected state
-  - Zeros resend counter
-  - Sets pending=true
-- `onDataRecv()` compares incoming motor status (direction, enable) against expected
-  - If match found: pending=false (acknowledged)
-  - If mismatch: stays pending for resend
-- `espnow_process()` resends pending commands every 400ms, up to 5 retries
-  - After 5 failed resends, gives up (user should re-input command)
+**Per-device runtime state** (`DeviceState` struct):
+- Common: `online`, `new_data` flag, `last_seen` timestamp
+- Motor: `duty`, `dir`, `enable`, `rpm` + motor command verification struct
+- IR: `mode`, `digital_state`, `analog_value`
+- Color: `mode`, `r`, `g`, `b`, `lux`
 
-**`onDataRecv()`** -- Runs in the Wi-Fi task (not `loop()`). **Never call `Serial.print()` directly** -- it will be interrupted. Instead:
-1. Parses incoming packet by type byte
-2. Formats output string into fixed buffer with `snprintf()`
-3. Sets volatile flag to signal `loop()` that buffer is ready
-4. For motor status: verifies against expected state
+**Poll state machine** (inside `espnow_hub_process()`):
+1. Send `PollPacket` to device at `g_poll_idx`
+2. Wait for response (flag set by `onDataRecv()`)
+3. If response within 30 ms: output JSON, mark online, advance
+4. If timeout: mark offline (if no recent contact), advance
+5. Between polls, check all devices for unsolicited on-change data and print
 
-**Receive buffers**:
-| Buffer | Flag | Source Packet | Verified? |
-|--------|------|---------------|-----------|
-| `g_motor_line[64]` | `g_motor_new` | `MotorStatusPacket` | Yes (state compared) |
-| `g_ir_line[32]` | `g_ir_new` | `IRStatusPacket` | No |
-| `g_color_line[48]` | `g_color_new` | `ColorStatusPacket` | No |
+**`onDataRecv()`** -- Identifies source device by MAC via `findDeviceByMac()`. Updates the matching `DeviceState` fields and sets `new_data = true`. For motor status, also verifies against expected state (resend on mismatch, up to 5 retries at 400 ms intervals).
 
-**`espnow_process()`** -- Called from `loop()`. For each flag:
-1. **motor**: Check if pending command needs resend (400ms elapsed, < 5 resends)
-2. **all**: If flag set, print buffered line and clear flag
+**Motor command verification** (per-device):
+- `espnow_send_motor_cmd()` arms verification: stores expected duty/dir/enable, sets `pending = true`
+- Each incoming motor status is compared against expected dir + enable
+- If mismatch persists, `espnow_hub_process()` auto-resends every 400 ms, up to 5 times
 
-**`espnow_send_motor_control(duty, direction, enable)`** -- Builds `motorControlPacket` and sends. **Always call `espnow_set_motor_expected()` after this** (done in `motor.cpp` harness).
-
-**`espnow_set_motor_expected(duty, direction, enable)`** -- Arms state verification. Compare-point is direction + enable bits only (duty may still be ramping on C3 side).
-
-**`espnow_send_ir_control(mode)`** -- Builds and sends `IRControlPacket {4, mode}`.
-
-**`espnow_send_color_control(command)`** -- Builds and sends `ColorControlPacket {7, command}`.
-
-**Serial output formats**:
-| Packet | Mode | Output |
-|--------|------|--------|
-| Motor | -- | `[Motor] 75% FWD ON 250RPM` |
-| IR | Digital -- obstacle | `[IR] OBSTACLE` |
-| IR | Digital -- clear | `[IR] Clear` |
-| IR | Analog | `[IR] analog: 2048` |
-| Color | 0 (RGB) | `[Color] R:128 G:64 B:32` |
-| Color | 1 (Lux) | `[Color] 450lx` |
-| Color | 2 (RGB+Lux) | `[Color] R:128 G:64 B:32  450lx` |
+**JSON output** -- One JSON object per line on Serial:
+```json
+{"slot":3,"type":"motor","online":true,"duty":75,"dir":1,"en":1,"rpm":250}
+{"slot":2,"type":"ir","online":true,"mode":0,"digital":1,"analog":0}
+{"slot":1,"type":"color","online":true,"mode":2,"r":128,"g":64,"b":32,"lux":450}
+{"slot":4,"type":"ir","online":false}
+```
 
 ---
 
 ### S3 Board -- `S3/src/main.cpp`
 
-Entry point for the S3. Handles serial command input and calls `espnow_process()` to print incoming status.
+Entry point for the S3 hub. Handles serial command input with slot routing and calls `espnow_hub_process()` for poll cycle + JSON output.
 
-**Available commands** (typed into serial monitor):
+**Command format**: `<slot>:<command>` where slot is 1-5.
+
+**Motor commands** (slots 3, 5):
 
 | Command | Packet Sent | Effect |
 |---------|-------------|--------|
-| `0`-`100` | `motorControlPacket {2, N, dir, 1}` | Set motor duty cycle (< 10 = stop) |
-| `F` | `motorControlPacket {2, duty, 1, en}` | Set motor direction to forward |
-| `R` | `motorControlPacket {2, duty, 0, en}` | Set motor direction to reverse |
-| `S` | `motorControlPacket {2, 0, dir, 0}` | Stop motor (duty=0, enable=0) |
-| `digital` | `IRControlPacket {4, 0}` | Switch C3 IR to digital mode |
-| `analog` | `IRControlPacket {4, 1}` | Switch C3 IR to analog mode |
-| `c` | `ColorControlPacket {7, 0}` | Switch color to RGB-only display |
-| `l` | `ColorControlPacket {7, 1}` | Switch color to lux-only display |
-| `cl` | `ColorControlPacket {7, 2}` | Switch color to RGB+Lux display |
-| `ledon` | `ColorControlPacket {7, 3}` | Turn color sensor LED on |
-| `ledoff` | `ColorControlPacket {7, 4}` | Turn color sensor LED off |
+| `3:75` | `motorControlPacket {2, 75, dir, 1}` | Set duty cycle to 75% on Motor-1 |
+| `5:F` | `motorControlPacket {2, duty, 1, en}` | Set Motor-2 direction to forward |
+| `3:R` | `motorControlPacket {2, duty, 0, en}` | Set Motor-1 direction to reverse |
+| `5:S` | `motorControlPacket {2, 0, dir, 0}` | Stop Motor-2 (duty=0, enable=0) |
+| `3:0`-`3:100` | varies | Set duty (< 10 = stop) |
 
-The S3 maintains motor state locally (`g_motor_duty`, `g_motor_dir`, `g_motor_enable`) so that partial commands (e.g. just changing direction) send the full current state.
+**Color commands** (slot 1):
+
+| Command | Packet Sent | Effect |
+|---------|-------------|--------|
+| `1:C` | `ColorControlPacket {7, 0}` | RGB-only display mode |
+| `1:L` | `ColorControlPacket {7, 1}` | Lux-only display mode |
+| `1:CL` or `1:B` | `ColorControlPacket {7, 2}` | RGB + Lux display mode |
+| `1:O` | `ColorControlPacket {7, 3}` | Turn color sensor LED on |
+| `1:X` | `ColorControlPacket {7, 4}` | Turn color sensor LED off |
+
+**IR commands** (slots 2, 4):
+
+| Command | Packet Sent | Effect |
+|---------|-------------|--------|
+| `2:D` | `IRControlPacket {4, 0}` | Switch IR-1 to digital mode |
+| `4:A` | `IRControlPacket {4, 1}` | Switch IR-2 to analog mode |
+
+The S3 maintains per-motor local state so that partial commands (e.g. just `F` for forward) send the full current state including duty.
 
 **Loop structure**:
 ```
 loop()
-  +-- espnow_process()     -> print any buffered Motor/IR/Color status from C3
-  +-- Serial.available()   -> read command, send control packet
+  +-- espnow_hub_process()  -> poll FSM + print JSON for new data
+  +-- Serial.available()    -> read command, route to slot, send packet
 ```
 
 ---
 
 ## Message Flow
 
-### Motor Control (S3 -> C3 -> S3)
+### Poll Cycle (S3 round-robin)
 ```
-S3: User types "75" (duty cycle)
-S3: espnow_send_motor_control(75, 1, 1) -> motorControlPacket {2, 75, 1, 1}
+S3: sendPoll(slot 1)  -> PollPacket {9} to A0:76:4E:7B:3C:38
+C3 Slot 1: onDataRecv() -> sendColorStatus()
+    -> ColorStatusPacket {6, 2, 128, 64, 32, lux_h, lux_l}
+S3: onDataRecv() -> g_dev[0].new_data = true
+S3: espnow_hub_process() -> print JSON:
+    {"slot":1,"type":"color","online":true,"mode":2,"r":128,"g":64,"b":32,"lux":450}
 
-C3: onDataRecv() -> g_motor->handleControl(cmd)
-C3: setDirection(forward), setEnabled(true), setDutyCycle(75)
-C3: mapDutyCycle(75) -> mapped to ~79% actual duty
+S3: sendPoll(slot 2) -> PollPacket {9} to A0:76:4E:4A:09:08
+C3 Slot 2: responds with IRStatusPacket
+S3: {"slot":2,"type":"ir","online":true,"mode":0,"digital":0,"analog":0}
+
+... (slots 3, 4, 5) ...
+
+S3: cycle repeats (~60ms total)
+```
+
+### Motor Control via Slot (S3 -> C3 -> S3)
+```
+S3: User types "3:75" (slot 3, duty 75%)
+S3: espnow_send_motor_cmd(3, 75, 1, 1) -> motorControlPacket {2, 75, 1, 1}
+    sent to A0:76:4E:7B:9A:B4 (Motor-1)
+
+C3 Slot 3: onDataRecv() -> g_motor->handleControl(cmd)
 C3: state_changed_ = true
-C3: espnow_update() detects flag -> sendMotorStatus()
-    -> MotorStatusPacket {3, 79, 1, 1, rpm_high, rpm_low}
+C3: espnow_update() -> on-change push -> sendMotorStatus()
+    -> MotorStatusPacket {3, 79, 1, 1, rpm_h, rpm_l}
 
-S3: onDataRecv() -> snprintf("[Motor] 79% FWD ON 250RPM") -> g_motor_new = true
-S3: loop() -> espnow_process() -> Serial.println("[Motor] 79% FWD ON 250RPM")
+S3: onDataRecv() -> updates g_dev[2], new_data = true
+S3: espnow_hub_process() -> print JSON:
+    {"slot":3,"type":"motor","online":true,"duty":79,"dir":1,"en":1,"rpm":250}
 ```
 
-### Motor Direction Change (S3 -> C3 -> S3)
+### Color Command via Slot (S3 -> C3 -> S3)
 ```
-S3: User types "R" (reverse)
-S3: espnow_send_motor_control(75, 0, 1) -> motorControlPacket {2, 75, 0, 1}
+S3: User types "1:C" (slot 1, RGB mode)
+S3: espnow_send_color_cmd(1, 0) -> ColorControlPacket {7, 0}
+    sent to A0:76:4E:7B:3C:38 (Color-1)
 
-C3: onDataRecv() -> g_motor->handleControl(cmd)
-C3: setDirection(false) -> GPIO3 LOW
-C3: state_changed_ = true -> sendMotorStatus()
-
-S3: [Motor] 79% REV ON 248RPM
-```
-
-### Motor Stop (S3 -> C3 -> S3)
-```
-S3: User types "S" (stop)
-S3: espnow_send_motor_control(0, 0, 0) -> motorControlPacket {2, 0, 0, 0}
-
-C3: setEnabled(false) -> PWM output = 0
-C3: state_changed_ = true -> sendMotorStatus()
-
-S3: [Motor] 0% REV OFF 0RPM
-```
-
-### IR Mode Switch (S3 -> C3 -> S3)
-```
-S3: User types "analog"
-S3: espnow_send_ir_control(1) -> IRControlPacket {4, 1}
-
-C3: onDataRecv() -> g_ir->handleControl(cmd)
-C3: activateAnalogMode() -- GPIO4 goes high-Z, ADC enabled on GPIO3
-C3: state_changed_ = true
-C3: espnow_update() detects flag -> sendIRStatus()
-    -> IRStatusPacket {5, 1, obstacle, analog_high, analog_low}
-
-S3: onDataRecv() -> snprintf("[IR] analog: XXXX") -> g_ir_new = true
-S3: loop() -> espnow_process() -> Serial.println("[IR] analog: XXXX")
-```
-
-### Color Mode Switch (S3 -> C3 -> S3)
-```
-S3: User types "c"
-S3: espnow_send_color_control(0) -> ColorControlPacket {7, 0}
-
-C3: onDataRecv() -> g_color->handleControl(cmd)
+C3 Slot 1: onDataRecv() -> g_color->handleControl(cmd)
 C3: mode_ = kColorRGB, state_changed_ = true
-C3: espnow_update() detects flag -> sendColorStatus()
-    -> ColorStatusPacket {6, 0, r, g, b, lux_high, lux_low}
+C3: espnow_update() -> on-change push -> sendColorStatus()
 
-S3: onDataRecv() -> mode==0 -> snprintf("[Color] R:%d G:%d B:%d")
-S3: loop() -> espnow_process() -> Serial.println("[Color] R:128 G:64 B:32")
+S3: {"slot":1,"type":"color","online":true,"mode":0,"r":128,"g":64,"b":32,"lux":450}
 ```
 
-### Color LED Control (S3 -> C3, no response)
+### Device Offline Detection
 ```
-S3: User types "ledoff"
-S3: espnow_send_color_control(4) -> ColorControlPacket {7, 4}
+S3: sendPoll(slot 4) -> PollPacket {9} to 34:B4:72:48:F1:A8
 
-C3: onDataRecv() -> g_color->handleControl(cmd)
-C3: digitalWrite(led_pin_, LOW) -- LED turns off
-C3: (no state_changed_ flag set -- no status packet sent)
+[30ms timeout -- no response]
+
+S3: g_dev[3].online = false
+S3: {"slot":4,"type":"ir","online":false}
+S3: advance to slot 5
 ```
 
-### Periodic Status (every 500-1000 ms)
+### Unsolicited On-Change Push (between polls)
 ```
-C3: espnow_update() timer fires for each registered subsystem
-C3: sendMotorStatus() (1s) / sendIRStatus() (500ms) / sendColorStatus() (500ms)
-C3: Sends packet to S3
+S3: currently polling slot 2, waiting for response...
 
-S3: Receives, formats into buffer, prints from loop()
+C3 Slot 3 (Motor-1): obstacle causes RPM change
+C3: state_changed_ = true -> sendMotorStatus() [unsolicited]
+
+S3: onDataRecv() from slot 3 MAC -> updates g_dev[2].new_data = true
+S3: espnow_hub_process() -> prints slot 3 JSON between poll steps:
+    {"slot":3,"type":"motor","online":true,"duty":79,"dir":1,"en":1,"rpm":180}
 ```
 
 ---
@@ -711,12 +723,15 @@ S3: Receives, formats into buffer, prints from loop()
 | Property | Value |
 |----------|-------|
 | Max packet size | 250 bytes (ESP-NOW limit) |
-| Typical latency | < 10 ms |
-| IR status interval | 500 ms + on change |
-| Color status interval | 500 ms + on change |
-| Motor status interval | 1000 ms + on change |
+| Typical latency (single packet) | < 10 ms |
+| Poll timeout per device | 30 ms |
+| Full poll cycle (5 devices) | ~50-75 ms |
+| Effective refresh rate | ~13-20 Hz |
+| On-change latency | < 10 ms (unsolicited push) |
+| Motor command resend interval | 400 ms (max 5 retries) |
+| Number of peers | 5 (max 20 unencrypted on ESP32) |
 | Encryption | Disabled |
-| Retransmission | None (fire-and-forget) |
+| Serial output format | JSON, one object per line |
 
 ---
 
@@ -763,19 +778,19 @@ lib_deps =
 **Root cause**: ESP-NOW is fire-and-forget. Packets can be lost. No verification on S3 side.
 
 **Fix**: Added S3-side motor state verification layer (`ESPNOW_S3.cpp`):
-- `espnow_set_motor_expected(duty, dir, en)` stores the commanded state
-- Each incoming motor status is compared against expected
+- Each motor slot has its own `motor_exp` struct tracking: duty, dir, enable, sent_time, resend_count, pending
+- `espnow_send_motor_cmd(slot, duty, dir, en)` arms verification for that slot
+- Each incoming motor status from the matching MAC is compared against expected
 - If direction or enable doesn't match and 400ms+ elapsed, auto-resend (up to 5 retries)
-- Call `espnow_set_motor_expected()` after every motor command from S3
 
-**Example flow**:
+**Example flow** (multi-device):
 ```
-S3: espnow_send_motor_control(100, 1, 1)
-S3: espnow_set_motor_expected(100, 1, 1)  // Arm verification
+S3: espnow_send_motor_cmd(3, 100, 1, 1)   // Slot 3 = Motor-1
+    -> sends to A0:76:4E:7B:9A:B4, arms g_dev[2].motor_exp
 
-[400ms passes, no matching status received]
+[400ms passes, no matching status received from slot 3]
 
-S3: espnow_send_motor_control(100, 1, 1)  // Resend
+S3: auto-resends motorControlPacket to slot 3   // Resend #1
 ```
 
 ---
@@ -784,29 +799,35 @@ S3: espnow_send_motor_control(100, 1, 1)  // Resend
 
 1. **Simultaneous DO+AO reading causes interference** -- solved by mode-exclusive pin reading (see design decision above).
 2. **GPIO10 is unusable on ESP32-C3-MINI-1** -- tied to SPI flash; any `digitalRead()` on it will always return the same state regardless of external signal.
-3. **GPIO4 pin conflict** -- used by both IR sensor (digital output) and color sensor (LED control). Only one can be active at a time; IR is currently removed from `main.cpp`.
-4. **Single peer** -- S3 is hardcoded to one C3 MAC and vice versa.
-5. **No packet loss detection** -- packets are fire-and-forget with no sequence numbers or ACK beyond the ESP-NOW layer's `onDataSent` callback.
-6. **Color sensor always reads all channels** -- mode only affects what the S3 displays, not what the C3 samples. All R/G/B/Lux values are always present in the status packet.
-7. **Single encoder instance** -- the `Encoder` class uses a static singleton for ISR routing; only one encoder is supported at a time.
-8. **Encoder gear ratio is approximate** -- `kGearRatio` is set to 21.3 for the 25GA370 280RPM variant. Adjust in `Encoder.h` if your motor has a different gear ratio.
+3. **GPIO4 pin conflict** -- used by both IR sensor (digital output) and color sensor (LED control). Each C3 now runs only one subsystem, avoiding the conflict.
+4. **No packet loss detection** -- packets are fire-and-forget with no sequence numbers or ACK beyond the ESP-NOW layer's `onDataSent` callback. Motor commands use S3-side resend verification.
+5. **Color sensor always reads all channels** -- mode only affects what the S3 displays, not what the C3 samples. All R/G/B/Lux values are always present in the status packet.
+6. **Single encoder instance per C3** -- the `Encoder` class uses a static singleton for ISR routing; only one encoder per C3.
+7. **Encoder gear ratio is approximate** -- `kGearRatio` is set to 21.3 for the 25GA370 280RPM variant. Adjust in `Encoder.h` if your motor has a different gear ratio.
+8. **S3 MAC hardcoded on all C3s** -- each C3 has the S3's MAC (`30:ED:A0:27:8F:A4`) compiled in. If the S3 board changes, all C3 firmwares must be rebuilt.
+9. **Poll timeout marks offline aggressively** -- a C3 that misses 3 consecutive polls (90 ms) is marked offline. Transient Wi-Fi interference may cause brief offline flickers.
 
 ---
 
-## Adding a New Sensor Subsystem
+## Adding a New Peripheral C3
 
-To add a new sensor (e.g. ultrasonic, temperature) following the same pattern:
+To add a new C3 board (e.g. a third motor, an ultrasonic sensor):
 
-**C3 side**:
+**S3 side**:
+1. Add the C3's MAC and type to `kDeviceList[]` in `ESPNOW_S3.h`.
+2. Increment `kNumDevices`.
+3. If it's a new sensor type: add packet structs, a new `PeripheralType` enum value, `onDataRecv()` dispatch branch, JSON printer, and `espnow_send_xxx_cmd()` function.
+4. Add command handling in `main.cpp` for the new type.
+
+**C3 side** (for a new sensor type):
 1. Create `MySensor.h` / `MySensor.cpp` with `init()`, `update()`, `handleControl()`, `checkAndClearStateChanged()`.
 2. Define control/status packet structs in `MySensor.h` and assign new `PacketType` values in `ESPNOW_C3.h`.
 3. Add `espnow_register_mysensor(MySensor *s)` to `ESPNOW_C3.h`.
-4. In `ESPNOW_C3.cpp`: add `g_mysensor` pointer, `sendMySensorStatus()`, dispatch in `onDataRecv()`, periodic timer in `espnow_update()`.
-5. In `main.cpp`: declare instance, call `init()`, call `espnow_register_mysensor()`, call `update()` in loop.
+4. In `ESPNOW_C3.cpp`: add `g_mysensor` pointer, `sendMySensorStatus()`, dispatch in `onDataRecv()`, and send in poll handler.
+5. Create a new example harness (e.g. `mySensorExample.txt`).
 
-**S3 side**:
-1. Add matching packet structs to `ESPNOW_S3.h`.
-2. Add `espnow_send_mysensor_control()` function in `ESPNOW_S3.h`/`.cpp`.
-3. Add dispatch branch in `onDataRecv()` in `ESPNOW_S3.cpp` using the same snprintf-buffer pattern.
-4. Add command handling in `main.cpp`.
+**For an existing sensor type** (e.g. adding a third IR sensor):
+1. Flash the same IR example firmware to the new C3 board.
+2. Add its MAC + `kPeripheralIR` to `kDeviceList[]` on S3.
+3. No other code changes needed.
 

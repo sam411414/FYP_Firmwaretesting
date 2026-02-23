@@ -17,7 +17,9 @@ enum PacketType : uint8_t {
   kPacketIRControl    = 4,  // IR control       (S3→C3)
   kPacketIRStatus     = 5,  // IR status        (C3→S3)
   kPacketColorStatus  = 6,  // Color status     (C3→S3)
-  kPacketColorControl = 7   // Color control    (S3→C3)
+  kPacketColorControl = 7,  // Color control    (S3→C3)
+  kPacketMacAddr      = 8,  // MAC announce     (C3→S3)  [reserved]
+  kPacketPoll         = 9   // Poll request     (S3→C3)
 };
 
 // Initialise ESP-NOW transport layer (call once before registering subsystems)

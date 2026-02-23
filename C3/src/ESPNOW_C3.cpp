@@ -17,13 +17,9 @@ constexpr uint8_t kS3MacAddr[6] = {0x30, 0xED, 0xA0, 0x27, 0x8F, 0xA4};
 uint8_t g_s3_mac[6] = {0};
 bool g_s3_peer_added = false;
 
-// Per-subsystem periodic timers
-constexpr unsigned long kMotorStatusIntervalMs = 1000;
-constexpr unsigned long kIRStatusIntervalMs    = 500;
-constexpr unsigned long kColorStatusIntervalMs = 500;
-unsigned long g_last_motor_status_time = 0;
-unsigned long g_last_ir_status_time    = 0;
-unsigned long g_last_color_status_time = 0;
+// Periodic timers removed — S3 hub polls each C3 via kPacketPoll.
+// On-change pushing is kept: if a subsystem flags state_changed_,
+// espnow_update() sends an unsolicited status packet immediately.
 
 void onDataSent(const uint8_t *mac, esp_now_send_status_t status) {}
 
@@ -112,6 +108,14 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
     return;
   }
 
+  // ── Poll request — respond with whatever subsystem is registered ─
+  if (type == kPacketPoll) {
+    if (g_motor) sendMotorStatus();
+    if (g_ir)    sendIRStatus();
+    if (g_color) sendColorStatus();
+    return;
+  }
+
   // ── Color control packet (only if color registered) ──────────────
   if (type == kPacketColorControl &&
       len >= static_cast<int>(sizeof(ColorControlPacket)) &&
@@ -152,38 +156,18 @@ void espnow_register_color(ColorSensor *cs) {
 }
 
 void espnow_update() {
-  unsigned long now = millis();
+  // On-change: if a subsystem flagged a state change, push immediately.
+  // Regular updates are handled by S3 polling (kPacketPoll).
 
-  // ── Motor status ──────────────────────────────────────────────────
-  if (g_motor != nullptr) {
-    if (g_motor->checkAndClearStateChanged()) {
-      sendMotorStatus();
-    }
-    if (now - g_last_motor_status_time >= kMotorStatusIntervalMs) {
-      g_last_motor_status_time = now;
-      sendMotorStatus();
-    }
+  if (g_motor != nullptr && g_motor->checkAndClearStateChanged()) {
+    sendMotorStatus();
   }
 
-  // ── IR status ─────────────────────────────────────────────────────
-  if (g_ir != nullptr) {
-    if (g_ir->checkAndClearStateChanged()) {
-      sendIRStatus();
-    }
-    if (now - g_last_ir_status_time >= kIRStatusIntervalMs) {
-      g_last_ir_status_time = now;
-      sendIRStatus();
-    }
+  if (g_ir != nullptr && g_ir->checkAndClearStateChanged()) {
+    sendIRStatus();
   }
 
-  // ── Color status ──────────────────────────────────────────────────
-  if (g_color != nullptr) {
-    if (g_color->checkAndClearStateChanged()) {
-      sendColorStatus();
-    }
-    if (now - g_last_color_status_time >= kColorStatusIntervalMs) {
-      g_last_color_status_time = now;
-      sendColorStatus();
-    }
+  if (g_color != nullptr && g_color->checkAndClearStateChanged()) {
+    sendColorStatus();
   }
 }
