@@ -8,14 +8,6 @@
 
 namespace {
 
-// Internal struct — only used for sending motor status
-struct StatusPacket {
-  uint8_t type;
-  uint8_t duty_cycle;
-  uint8_t direction;
-  uint8_t enable;
-};
-
 // ── Registered subsystems (nullptr = not registered) ────────────────
 MotorController *g_motor = nullptr;
 IRSensor        *g_ir    = nullptr;
@@ -26,7 +18,7 @@ uint8_t g_s3_mac[6] = {0};
 bool g_s3_peer_added = false;
 
 // Per-subsystem periodic timers
-constexpr unsigned long kMotorStatusIntervalMs = 5000;
+constexpr unsigned long kMotorStatusIntervalMs = 1000;
 constexpr unsigned long kIRStatusIntervalMs    = 500;
 constexpr unsigned long kColorStatusIntervalMs = 500;
 unsigned long g_last_motor_status_time = 0;
@@ -53,11 +45,14 @@ bool ensureS3Peer() {
 void sendMotorStatus() {
   if (g_motor == nullptr || !ensureS3Peer()) return;
 
-  StatusPacket status = {};
+  MotorStatusPacket status = {};
   status.type = kPacketStatus;
   status.duty_cycle = g_motor->getCurrentDutyCycle();
   status.direction = g_motor->getDirection() ? 1 : 0;
   status.enable = g_motor->isEnabled() ? 1 : 0;
+  uint16_t rpm = g_motor->getRPM();
+  status.rpm_high = static_cast<uint8_t>((rpm >> 8) & 0xFF);
+  status.rpm_low  = static_cast<uint8_t>(rpm & 0xFF);
 
   esp_now_send(g_s3_mac, reinterpret_cast<const uint8_t *>(&status), sizeof(status));
 }

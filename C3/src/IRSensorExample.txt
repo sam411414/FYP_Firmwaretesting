@@ -1,10 +1,13 @@
 // ═══════════════════════════════════════════════════════════════════
-// S3 main.cpp — MAC Address Receiver
-// Receives C3's MAC address via ESP-NOW and displays it
+// IR Sensor Test Harness — rename to main.cpp to use
+// Tests: IRSensor via ESP-NOW from S3
 // ═══════════════════════════════════════════════════════════════════
 #include <Arduino.h>
 #include <WiFi.h>
-#include "ESPNOW_S3.h"
+#include "IRSensor.h"
+#include "ESPNOW_C3.h"
+
+IRSensor ir_sensor(4, 3);  // DO: GPIO4, AO: GPIO3
 
 void setup() {
   Serial.begin(115200);
@@ -13,18 +16,22 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
 
-  Serial.print("\n[S3 MAC] ");
+  Serial.println("[C3] IR sensor test harness");
+  Serial.print("MAC: ");
   Serial.println(WiFi.macAddress());
-  
-  // Initialize ESP-NOW to receive MAC address announcements
-  // Use broadcast MAC initially since we don't know C3's MAC yet
-  uint8_t broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-  espnow_init_sender(broadcast_mac);
 
-  Serial.println("[S3] Waiting for C3 MAC address announcement...");
+  // Init transport
+  espnow_init();
+
+  // IR sensor
+  ir_sensor.init();
+  espnow_register_ir(&ir_sensor);
+
+  Serial.println("[C3] IR sensor registered, waiting for S3 commands...");
 }
 
 void loop() {
-  espnow_process();
+  ir_sensor.update();
+  espnow_update();
   delay(10);
 }

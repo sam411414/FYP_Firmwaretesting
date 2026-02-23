@@ -1,0 +1,74 @@
+// ═══════════════════════════════════════════════════════════════════
+// Color Sensor Test Harness (S3 side) — rename to main.cpp to use
+// Commands: c (RGB), l (Lux), cl (RGB+Lux), ledon, ledoff
+// Displays: [Color] R:XXX G:XXX B:XXX  XXXlx
+// ═══════════════════════════════════════════════════════════════════
+#include <Arduino.h>
+#include <WiFi.h>
+#include "ESPNOW_S3.h"
+
+namespace {
+constexpr uint8_t kC3MacAddr[6] = {0xA0, 0x76, 0x4E, 0x7B, 0x9A, 0xB4};
+} // namespace
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  Serial.print("S3 MAC Address: ");
+  Serial.println(WiFi.macAddress());
+
+  espnow_init_sender(kC3MacAddr);
+
+  Serial.println("=== Color Sensor Test ===");
+  Serial.println("c      : RGB mode");
+  Serial.println("l      : Lux mode");
+  Serial.println("cl     : RGB + Lux mode");
+  Serial.println("ledon  : LED on");
+  Serial.println("ledoff : LED off");
+}
+
+void loop() {
+  espnow_process();
+
+  if (!Serial.available()) {
+    delay(10);
+    return;
+  }
+
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+  line.toLowerCase();
+  if (line.isEmpty()) return;
+
+  if (line == "c") {
+    espnow_send_color_control(0);
+    Serial.println("Color -> RGB mode");
+    return;
+  }
+  if (line == "l") {
+    espnow_send_color_control(1);
+    Serial.println("Color -> LUX mode");
+    return;
+  }
+  if (line == "cl") {
+    espnow_send_color_control(2);
+    Serial.println("Color -> RGB+LUX mode");
+    return;
+  }
+  if (line == "ledon") {
+    espnow_send_color_control(3);
+    Serial.println("Color LED -> ON");
+    return;
+  }
+  if (line == "ledoff") {
+    espnow_send_color_control(4);
+    Serial.println("Color LED -> OFF");
+    return;
+  }
+
+  Serial.println("Unknown. Use: c / l / cl / ledon / ledoff");
+}
