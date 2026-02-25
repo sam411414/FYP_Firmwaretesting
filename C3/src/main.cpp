@@ -2,11 +2,19 @@
 #include <WiFi.h>
 #include "motorControl.h"
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
 #include "ESPNOW_C3.h"
 #include "ColorSensor.h"
 
 //MotorController motor;
 ColorSensor color_sensor(5, 6, 4); // SDA: GPIO5, SCL: GPIO6, LED: GPIO4
+=======
+#include "ESPNOW.h"
+#include "Ultrasonic.h"
+
+//MotorController motor;
+Ultrasonic ultrasonic(2, 3); // TRIG=2, ECHO=3
+>>>>>>> Stashed changes
 =======
 #include "ESPNOW.h"
 #include "Ultrasonic.h"
@@ -31,6 +39,7 @@ void setup() {
   //espnow_register_motor(&motor);
 
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
   color_sensor.init();
   espnow_register_color(&color_sensor);
 }
@@ -41,6 +50,8 @@ void loop() {
   espnow_update();
 
 =======
+=======
+>>>>>>> Stashed changes
   ultrasonic.init();
 
  // espnow_init(&motor);
