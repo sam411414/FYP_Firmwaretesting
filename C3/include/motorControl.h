@@ -2,12 +2,25 @@
 
 #include <Arduino.h>
 
+// Forward declaration
+class Encoder;
+
 // Control packet received over ESP-NOW (motor-specific)
 struct motorControlPacket {
   uint8_t type;        // Must be kPacketControl (2)
-  uint8_t duty_cycle;  // 40-100
+  uint8_t duty_cycle;  // 0-100 (mapped internally)
   uint8_t direction;   // 0=reverse, 1=forward
   uint8_t enable;      // 0=stop, 1=run
+};
+
+// Motor status packet sent to S3 via ESP-NOW
+struct MotorStatusPacket {
+  uint8_t type;        // Must be kPacketStatus (3)
+  uint8_t duty_cycle;  // Current mapped duty cycle %
+  uint8_t direction;   // 0=reverse, 1=forward
+  uint8_t enable;      // 0=stopped, 1=running
+  uint8_t rpm_high;    // RPM >> 8
+  uint8_t rpm_low;     // RPM & 0xFF
 };
 
 // Motor control pin definitions
@@ -22,7 +35,7 @@ constexpr uint32_t kDefaultFreqHz = 20000;
 // Duty cycle mapping limits (actual PWM duty percentages)
 constexpr uint8_t kDutyLowerLimit = 30;  // Minimum actual duty cycle (%)
 constexpr uint8_t kDutyUpperLimit = 95;  // Maximum actual duty cycle (%)
-constexpr uint8_t kDutyStopThreshold = 15; // Input below this = stop
+constexpr uint8_t kDutyStopThreshold = 10; // Input below this = stop
 
 // Motor control class for DRV8835 interface
 class MotorController {
@@ -47,12 +60,16 @@ public:
   // Handle an incoming motorControlPacket
   void handleControl(const motorControlPacket &cmd);
 
+  // Attach an encoder for RPM measurement
+  void attachEncoder(Encoder *enc);
+
   // Get current settings
   uint8_t getCurrentDutyCycle() const { return current_duty_pct_; }
   uint8_t getTargetDutyCycle() const { return target_duty_pct_; }
   uint32_t getFrequency() const { return freq_hz_; }
   bool getDirection() const { return direction_; }
   bool isEnabled() const { return enabled_; }
+  uint16_t getRPM() const;
   
   // Check and clear state change flag
   bool checkAndClearStateChanged() { 
@@ -72,6 +89,7 @@ private:
   bool direction_change_pending_; // True while mid-direction-change
   bool enabled_;
   bool state_changed_;            // Flag indicating motor state has changed
+  Encoder *encoder_;              // Attached encoder (nullptr if none)
   
   // Internal PWM application
   void applyPwm();

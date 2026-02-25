@@ -1,16 +1,16 @@
 #include "motorControl.h"
+#include "Encoder.h"
 
 MotorController::MotorController() 
   : freq_hz_(kDefaultFreqHz), current_duty_pct_(0), target_duty_pct_(0),
     saved_target_duty_(0), last_ramp_time_(0), direction_(true),
     pending_direction_(true), direction_change_pending_(false), enabled_(true),
-    state_changed_(false) {
+    state_changed_(false), encoder_(nullptr) {
 }
 
 void MotorController::initialize() {
   // Configure direction pin
   pinMode(kPhasePin, OUTPUT);
-  digitalWrite(kPhasePin, direction_ ? HIGH : LOW);
   
   // Configure PWM pin  
   ledcAttachPin(kEnablePin, kPwmChannel);
@@ -31,11 +31,17 @@ void MotorController::setDutyCycle(uint8_t duty_percent) {
 
 void MotorController::setDirection(bool forward) {
   direction_ = forward;
-  digitalWrite(kPhasePin, direction_ ? HIGH : LOW);
+  applyPwm();
 }
 
 void MotorController::setEnabled(bool enabled) {
   enabled_ = enabled;
+  if (!enabled_) {
+    // Zero duty for clean restart when re-enabled
+    target_duty_pct_ = 0;
+    current_duty_pct_ = 0;
+    direction_change_pending_ = false;
+  }
   applyPwm();
 }
 
@@ -43,20 +49,33 @@ void MotorController::applyPwm() {
   // Configure PWM channel with current frequency and resolution
   ledcSetup(kPwmChannel, freq_hz_, kPwmResolutionBits);
   
-  // Calculate duty value (0-1023 for 10-bit resolution)
-  const uint32_t duty_value = enabled_ ? (1023u * current_duty_pct_) / 100u : 0u;
+  // ── DRV8835 PH/EN mode (MODE pin HIGH) ───────────────────────────
+  //   PHASE pin = direction  (HIGH = one way, LOW = other)
+  //   ENABLE pin = speed PWM (duty directly proportional to speed)
+  //   No inversion needed — both directions are linear.
   
-  // Apply PWM signal
+  digitalWrite(kPhasePin, direction_ ? HIGH : LOW);
+  
+  if (!enabled_ || current_duty_pct_ == 0) {
+    ledcWrite(kPwmChannel, 0);
+    return;
+  }
+  
+  const uint32_t duty_value = (1023u * current_duty_pct_) / 100u;
   ledcWrite(kPwmChannel, duty_value);
 }
 
 void MotorController::update() {
+  // Update encoder RPM if attached
+  if (encoder_) {
+    encoder_->update();
+  }
+
   // If at target, check if a direction change needs completing
   if (current_duty_pct_ == target_duty_pct_) {
     if (direction_change_pending_ && current_duty_pct_ == 0) {
       // Motor has ramped to 0 — safe to flip direction
       direction_ = pending_direction_;
-      digitalWrite(kPhasePin, direction_ ? HIGH : LOW);
       direction_change_pending_ = false;
       // Now ramp back up to the saved target
       target_duty_pct_ = saved_target_duty_;
@@ -105,27 +124,40 @@ uint8_t MotorController::mapDutyCycle(uint8_t input_percent) {
 
 void MotorController::handleControl(const motorControlPacket &cmd) {
   // Store previous state for change detection
-  uint8_t prev_duty = current_duty_pct_;
+  uint8_t prev_target = target_duty_pct_;
   bool prev_direction = direction_;
   bool prev_enabled = enabled_;
   
-  setDirection(cmd.direction == 1);
-  setEnabled(cmd.enable == 1);
+  // Update direction (phase pin updated by applyPwm below)
+  direction_ = (cmd.direction == 1);
+  
   if (cmd.enable == 1) {
-    setDutyCycle(cmd.duty_cycle);
+    // Enabling motor with a duty cycle
+    enabled_ = true;
+    // Map and set target — ramp will handle the rest
+    uint8_t mapped = mapDutyCycle(cmd.duty_cycle);
+    target_duty_pct_ = mapped;
+  } else {
+    // Disabling: zero everything for a clean state
+    enabled_ = false;
+    target_duty_pct_ = 0;
+    current_duty_pct_ = 0;
+    direction_change_pending_ = false;
   }
-
-  Serial.print("CTRL duty=");
-  Serial.print(cmd.duty_cycle);
-  Serial.print(" dir=");
-  Serial.print(cmd.direction ? "FWD" : "REV");
-  Serial.print(" enable=");
-  Serial.println(cmd.enable ? "ON" : "OFF");
+  
+  // Apply current state to hardware immediately
+  applyPwm();
   
   // Send immediate status update if state changed
-  if (prev_duty != target_duty_pct_ || prev_direction != direction_ || prev_enabled != enabled_) {
-    // Note: We'll use external function to avoid circular dependencies
-    // This will be handled by a callback mechanism
+  if (prev_target != target_duty_pct_ || prev_direction != direction_ || prev_enabled != enabled_) {
     state_changed_ = true;
   }
+}
+
+void MotorController::attachEncoder(Encoder *enc) {
+  encoder_ = enc;
+}
+
+uint16_t MotorController::getRPM() const {
+  return encoder_ ? encoder_->getRPM() : 0;
 }

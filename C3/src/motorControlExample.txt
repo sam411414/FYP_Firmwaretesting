@@ -1,13 +1,15 @@
 // ═══════════════════════════════════════════════════════════════════
-// Color Sensor Test Harness — rename to main.cpp to use
-// Tests: ColorSensor (TCS34725) via ESP-NOW from S3
+// Motor Test Harness — rename to main.cpp to use
+// Tests: MotorController + Encoder via ESP-NOW from S3
 // ═══════════════════════════════════════════════════════════════════
 #include <Arduino.h>
 #include <WiFi.h>
-#include "ColorSensor.h"
+#include "motorControl.h"
+#include "Encoder.h"
 #include "ESPNOW_C3.h"
 
-ColorSensor color_sensor(5, 6, 4);  // SDA: GPIO5, SCL: GPIO6, LED: GPIO4
+MotorController motor;
+Encoder encoder(0, 1); // Use GPIO0 and GPIO1 for encoder A & B inputs
 
 void setup() {
   Serial.begin(115200);
@@ -16,22 +18,25 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
 
-  Serial.println("[C3] Color sensor test harness");
+  Serial.println("[C3] Motor test harness");
   Serial.print("MAC: ");
   Serial.println(WiFi.macAddress());
 
   // Init transport
   espnow_init();
 
-  // Color sensor
-  color_sensor.init();
-  espnow_register_color(&color_sensor);
+  // Motor + encoder
+  motor.initialize();
+  encoder.init();
+  motor.attachEncoder(&encoder);
+  motor.setEnabled(false);
+  espnow_register_motor(&motor);
 
-  Serial.println("[C3] Color sensor registered, waiting for S3 commands...");
+  Serial.println("[C3] Motor + encoder registered, waiting for S3 commands...");
 }
 
 void loop() {
-  color_sensor.update();
+  motor.update();
   espnow_update();
   delay(10);
 }
