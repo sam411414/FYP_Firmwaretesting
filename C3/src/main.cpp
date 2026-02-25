@@ -4,18 +4,12 @@
 // ═══════════════════════════════════════════════════════════════════
 #include <Arduino.h>
 #include <WiFi.h>
-#include <esp_now.h>
+#include "motorControl.h"
+#include "ESPNOW_C3.h"
+#include "ColorSensor.h"
 
-namespace {
-  constexpr uint8_t kPacketMacAddr = 8;
-  struct MacAddrPacket {
-    uint8_t type;       // kPacketMacAddr (8)
-    uint8_t mac[6];     // C3's MAC address
-  };
-  uint8_t g_broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-}
-
-void onDataSent(const uint8_t *mac, esp_now_send_status_t status) {}
+//MotorController motor;
+ColorSensor color_sensor(5, 6, 4); // SDA: GPIO5, SCL: GPIO6, LED: GPIO4
 
 void setup() {
   Serial.begin(115200);
