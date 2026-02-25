@@ -7,7 +7,7 @@
 #include "IRSensor.h"
 #include "ESPNOW_C3.h"
 
-IRSensor ir_sensor(4, 3);  // DO: GPIO4, AO: GPIO3
+IRSensor ir_sensor(10, 3);  // DO: GPIO10, AO: GPIO3
 
 void setup() {
   Serial.begin(115200);
